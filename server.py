@@ -380,7 +380,9 @@ class OvpnSlotManager:
             "--resolv-retry", "1",
             "--auth-nocache",
         ]
-        if not tcp_mode:
+        if tcp_mode:
+            cmd.extend(["--connect-timeout", "4"])
+        else:
             cmd.extend(["--mssfix", "1360", "--fast-io"])
         if abs_auth:
             cmd.extend(["--auth-user-pass", abs_auth])
@@ -1023,7 +1025,7 @@ class HttpToSocksBridge:
             for p in pending:
                 if clean_eof:
                     with contextlib.suppress(asyncio.TimeoutError, Exception):
-                        await asyncio.wait_for(p, timeout=10.0)
+                        await asyncio.wait_for(p, timeout=2.0)
                 else:
                     p.cancel()
         except Exception:
@@ -1112,7 +1114,7 @@ class GatewayServer:
     FAIL_COOLDOWN_S = 1800.0
     MAX_BODY_BYTES = 65536
     REQUEST_TIMEOUT_S = 10.0
-    LEASE_CONCURRENCY = 10
+    LEASE_CONCURRENCY = 6
     MAX_LEASE_ATTEMPTS_PER_SLOT = 8
     MAX_ROTATE_ATTEMPTS = 8
 
@@ -1248,7 +1250,6 @@ class GatewayServer:
         async with lock:
             bridge: HttpToSocksBridge | None = None
             async with self._lock:
-                self._mark_cooldown(cfg)
                 if cfg and self._reserved_cfgs.get(slot) == cfg:
                     self._reserved_cfgs.pop(slot, None)
                 lease_id = self._slot_owners.get(slot)
@@ -1259,7 +1260,9 @@ class GatewayServer:
                         entry = lease.slots.get(slot)
                     elif lease_id in self._pending_leases:
                         entry = next((e for e in self._pending_leases[lease_id] if e.slot == slot), None)
-                if entry is not None and cfg and entry.cfg == cfg:
+                active_crash = bool(entry is not None and cfg and entry.cfg == cfg)
+                self._mark_cooldown(cfg, self.FAIL_COOLDOWN_S if active_crash else self.COOLDOWN_S)
+                if active_crash and entry is not None:
                     bridge = entry.bridge
                     entry.bridge = None
                     entry.cfg = ""
