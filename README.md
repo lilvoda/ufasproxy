@@ -10,17 +10,18 @@ On-demand OpenVPN-to-Proxy API Gateway (`http://user:pass@host:port`) untuk work
 ## Quick Start
 ### 1. Gateway Server (Linux / VPS)
 ```bash
-sudo bash install.sh
+sudo bash install.sh --server
 # Buka firewall port 8080/tcp (API) dan 20001:20045/tcp (proxy slots)
 sudo python3 server.py --ovpn-dir /path/to/vpns-surfshark --port 8080 --token "<SECRET>"
 ```
 
-### 2. Client Checker (`old_browser_vpn.py`)
+### 2. Client Checker (`old_browser_vpn.py` di CT / Worker)
 ```bash
-pip install -r requirements.txt
-python3 old_browser_vpn.py -c combo.txt -w auto --vpn-api-url http://<GATEWAY_IP>:8080 --vpn-api-token "<SECRET>" --no-prompt
+bash install.sh --client
+source .venv/bin/activate
+python old_browser_vpn.py -c input/koi.txt -w auto --vpn-api-url http://<GATEWAY_IP>:8080 --vpn-api-token "<SECRET>" --no-prompt
 ```
-Atau simpan `UFASPROXY_URL` dan `UFASPROXY_TOKEN` di env / `.env` / `token.env`, lalu jalankan `python3 old_browser_vpn.py`.
+*(Jalankan `bash install.sh` tanpa flag untuk memilih mode `[1] Client`, `[2] Server`, atau `[3] Keduanya` secara interaktif. Simpan `UFASPROXY_URL` & `UFASPROXY_TOKEN` di env / `.env` / `token.env` untuk auto-connect.)*
 
 ## Mapping File & Plan
 Lihat [docs/PLAN.md](docs/PLAN.md) untuk pemetaan lengkap arsitektur, kontrak API, pengamanan SSH/kill-switch, dan tahapan implementasi.
