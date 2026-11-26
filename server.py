@@ -374,7 +374,7 @@ class OvpnSlotManager:
             "--data-ciphers", "AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305:AES-256-CBC",
             "--data-ciphers-fallback", "AES-256-CBC",
             "--script-security", "1",
-            "--ping-exit", "60",
+            "--ping-exit", "180",
             "--hand-window", "8",
             "--connect-retry", "1", "1",
             "--resolv-retry", "1",
@@ -1109,7 +1109,7 @@ class GatewayServer:
     """HTTP Bearer-authenticated OpenVPN proxy lease gateway with TTL reaper."""
 
     COOLDOWN_S = 180.0
-    FAIL_COOLDOWN_S = 900.0
+    FAIL_COOLDOWN_S = 1800.0
     MAX_BODY_BYTES = 65536
     REQUEST_TIMEOUT_S = 10.0
     LEASE_CONCURRENCY = 10
@@ -1911,7 +1911,7 @@ async def _selftest_async() -> None:
             ["--data-ciphers", "AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305:AES-256-CBC"],
             ["--data-ciphers-fallback", "AES-256-CBC"],
             ["--script-security", "1"],
-            ["--ping-exit", "60"],
+            ["--ping-exit", "180"],
             ["--hand-window", "8"],
             ["--connect-retry", "1", "1"],
             ["--resolv-retry", "1"],
