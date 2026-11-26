@@ -11,7 +11,7 @@ token.env
 .ufasproxy_state.json*
 *.log
 output/
-input/
+input/proxies.txt
 combo.txt
 vpn_proxies.txt*
 .browser_vpn_cache_state.json
