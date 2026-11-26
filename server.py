@@ -42,6 +42,14 @@ MT_API_PORT = 443
 MAX_HEADER_BYTES = 16384
 MAX_TTL_S = 86400.0
 AUTH_FILENAMES = ("auth.txt", ".auth", "credentials.txt", "pass.txt")
+_MT_SSL_CTX: ssl.SSLContext | None = None
+
+
+def _get_mt_ssl_ctx() -> ssl.SSLContext:
+    global _MT_SSL_CTX
+    if _MT_SSL_CTX is None:
+        _MT_SSL_CTX = ssl.create_default_context()
+    return _MT_SSL_CTX
 PROXY_407_RESPONSE = (
     b"HTTP/1.1 407 Proxy Authentication Required\r\n"
     b'Proxy-Authenticate: Basic realm="ufasproxy"\r\n'
@@ -231,7 +239,7 @@ async def _upgrade_tls(
 async def probe_socks_mt_api(
     socks_host: str,
     socks_port: int,
-    timeout_s: float = 5.0,
+    timeout_s: float = 3.8,
     max_rtt_ms: int = 3500,
 ) -> tuple[bool, int, str]:
     """Probe Moonton API over SOCKS5+TLS and enforce HTTP status + RTT budget."""
@@ -243,7 +251,7 @@ async def probe_socks_mt_api(
             reader, writer = await _socks5_connect(
                 socks_host, socks_port, MT_API_HOST, MT_API_PORT, timeout_s
             )
-            await _upgrade_tls(writer, ssl.create_default_context(), MT_API_HOST)
+            await _upgrade_tls(writer, _get_mt_ssl_ctx(), MT_API_HOST)
             req = (
                 f"HEAD / HTTP/1.1\r\n"
                 f"Host: {MT_API_HOST}\r\n"
@@ -309,8 +317,8 @@ class OvpnSlotManager:
     """Manage isolated ip netns OpenVPN slots with microsocks and kill-switch."""
 
     MAX_SLOTS = 200
-    HANDSHAKE_TIMEOUT_S = 18.0
-    STOP_WAIT_S = 0.5
+    HANDSHAKE_TIMEOUT_S = 9.0
+    STOP_WAIT_S = 0.4
 
     def __init__(
         self,
@@ -324,6 +332,7 @@ class OvpnSlotManager:
         self.state_dir = os.path.abspath(state_dir)
         self._on_unexpected_exit = on_unexpected_exit
         self._slots: dict[int, tuple[str, list[asyncio.subprocess.Process]]] = {}
+        self._slot_killswitch: dict[int, bool] = {}
         self._watchers: dict[int, asyncio.Task[None]] = {}
         self._setup_lock = asyncio.Lock()
         self._wan_iface = ""
@@ -366,8 +375,9 @@ class OvpnSlotManager:
             "--data-ciphers-fallback", "AES-256-CBC",
             "--script-security", "1",
             "--ping-exit", "60",
-            "--connect-retry", "1", "2",
-            "--resolv-retry", "2",
+            "--hand-window", "8",
+            "--connect-retry", "1", "1",
+            "--resolv-retry", "1",
             "--auth-nocache",
         ]
         if not tcp_mode:
@@ -403,7 +413,11 @@ class OvpnSlotManager:
             await self._run_checked(*base, *apply_args)
 
     async def _ensure_host_setup(self) -> None:
+        if self._wan_iface:
+            return
         async with self._setup_lock:
+            if self._wan_iface:
+                return
             rc, out, err = await self._run("ip", "-4", "route", "show", "default")
             matches = list(re.finditer(r"^default\b.*\bdev\s+(\S+)", out, re.MULTILINE))
             m = next((mm for mm in matches if not re.match(r"^(?:tun|tap)", mm.group(1), re.I)), None)
@@ -412,8 +426,6 @@ class OvpnSlotManager:
             if rc != 0 or m is None:
                 raise RuntimeError(f"Host IPv4 default route missing: {err.strip() or out.strip()}")
             wan_iface = m.group(1)
-            if self._wan_iface == wan_iface:
-                return
 
             await self._run_checked("sysctl", "-w", "net.ipv4.ip_forward=1")
             await self._ensure_iptables_rule(
@@ -565,92 +577,155 @@ class OvpnSlotManager:
             await asyncio.gather(*wait_tasks.keys(), return_exceptions=True)
             pass
 
-    async def start_slot(self, slot: int, cfg: str) -> bool:
-        self._validate_slot(slot)
-        abs_cfg = os.path.abspath(cfg)
+    async def _stop_openvpn_only(self, slot: int) -> asyncio.subprocess.Process | None:
+        """Stop only OpenVPN inside an existing kill-switch netns; return live microsocks if reusable."""
+        cur_task = asyncio.current_task()
+        w = self._watchers.pop(slot, None)
+        if w is not None and w is not cur_task and not w.done():
+            w.cancel()
+            await asyncio.gather(w, return_exceptions=True)
+
+        entry = self._slots.get(slot)
+        if entry is None or not self._slot_killswitch.get(slot) or len(entry[1]) < 2:
+            return None
+        ovpn_proc, ms_proc = entry[1][0], entry[1][1]
+        if ms_proc.returncode is not None:
+            return None
+
+        if ovpn_proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError, OSError):
+                ovpn_proc.terminate()
+            try:
+                await asyncio.wait_for(ovpn_proc.wait(), timeout=self.STOP_WAIT_S)
+            except asyncio.TimeoutError:
+                with contextlib.suppress(ProcessLookupError, OSError):
+                    ovpn_proc.kill()
+                with contextlib.suppress(Exception):
+                    await ovpn_proc.wait()
+
+        # Wait briefly for old tun interface removal so the next OpenVPN binds cleanly.
+        tun_deadline = time.monotonic() + 0.5
+        while time.monotonic() < tun_deadline:
+            if not await self._tun_is_up(slot):
+                break
+            await asyncio.sleep(0.05)
+        if await self._tun_is_up(slot) or ms_proc.returncode is not None:
+            return None
+
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(self._log_path(slot))
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(self._sanitized_cfg_path(slot))
+        self._slots[slot] = ("", [ms_proc])
+        return ms_proc
+
+    async def _launch_ovpn_and_probe(
+        self,
+        slot: int,
+        abs_cfg: str,
+        cfg_txt: str,
+        ms_proc: asyncio.subprocess.Process | None,
+        killswitch_ok: bool,
+    ) -> bool:
+        sanitized_txt, is_tcp = _sanitize_ovpn_content(cfg_txt)
+        san_cfg = self._sanitized_cfg_path(slot)
+        with open(san_cfg, "w", encoding="utf-8", errors="replace") as fh:
+            fh.write(sanitized_txt)
+        log_path = self._log_path(slot)
+        ovpn_cmd = self._build_ovpn_cmd(slot, abs_cfg, self.auth_file, config_override=san_cfg, is_tcp=is_tcp)
+        log_fh = open(log_path, "w", encoding="utf-8", errors="replace")
+        try:
+            ovpn_proc = await asyncio.create_subprocess_exec(
+                "ip", "netns", "exec", f"ovns{slot}", *ovpn_cmd,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=log_fh,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+        finally:
+            log_fh.close()
+
+        procs: list[asyncio.subprocess.Process] = [ovpn_proc]
+        if ms_proc is None and killswitch_ok:
+            ms_proc = await self._spawn_microsocks(slot)
+        if ms_proc is not None:
+            procs.append(ms_proc)
+        self._slots[slot] = (abs_cfg, procs)
+
+        deadline = time.monotonic() + self.HANDSHAKE_TIMEOUT_S
+        ready = False
+        last_sz = -1
+        log_txt = ""
+        while time.monotonic() < deadline:
+            if ovpn_proc.returncode is not None:
+                break
+            if ms_proc is not None and ms_proc.returncode is not None:
+                break
+            if os.path.isfile(log_path):
+                sz = os.path.getsize(log_path)
+                if sz != last_sz:
+                    last_sz = sz
+                    with open(log_path, "r", encoding="utf-8", errors="replace") as fh:
+                        log_txt = fh.read()
+            if "AUTH_FAILED" in log_txt:
+                LOG.warning("slot %d auth failed for %s", slot, abs_cfg)
+                break
+            if "Initialization Sequence Completed" in log_txt:
+                pids, tun_up = await asyncio.gather(self._netns_pids(slot), self._tun_is_up(slot))
+                if ovpn_proc.returncode is None and ovpn_proc.pid in set(pids) and tun_up:
+                    ready = True
+                    break
+            await asyncio.sleep(0.12)
+
+        if not ready:
+            return False
+
+        if ms_proc is None:
+            # Deferred kill-switch fallback: drop non-VPN default route and isolate host /30 gateway once tun0 is up.
+            await self._run(
+                "ip", "-n", f"ovns{slot}", "route", "del",
+                "default", "via", f"198.18.{slot}.1", "dev", f"ovw{slot}",
+            )
+            for fb_cmd in self._fallback_host_drop_cmds(slot):
+                await self._run(*fb_cmd)
+            ms_proc = await self._spawn_microsocks(slot)
+            procs.append(ms_proc)
+        if not await self._wait_tcp_ready(f"198.18.{slot}.2", 1080, ms_proc, timeout_s=1.0):
+            return False
+
+        ok, rtt_ms, detail = await probe_socks_mt_api(f"198.18.{slot}.2", 1080)
+        if not ok:
+            LOG.warning("slot %d MT probe failed (%s, %dms) on %s", slot, detail, rtt_ms, abs_cfg)
+            return False
+
+        self._watchers[slot] = asyncio.create_task(self._watch_ovpn_exit(slot, ovpn_proc, ms_proc))
+        return True
+
+    def _validate_cfg_text(self, slot: int, abs_cfg: str) -> str | None:
         if not os.path.isfile(abs_cfg):
             raise FileNotFoundError(f"ovpn config not found: {abs_cfg}")
-
         with open(abs_cfg, "r", encoding="utf-8", errors="replace") as fh:
             cfg_txt = fh.read()
         if not self.auth_file and re.search(r"(?im)^[ \t]*auth-user-pass[ \t]*(?:#.*)?$", cfg_txt):
             LOG.warning("slot %d config %s has bare auth-user-pass without auth_file", slot, abs_cfg)
+            return None
+        return cfg_txt
+
+    async def start_slot(self, slot: int, cfg: str) -> bool:
+        self._validate_slot(slot)
+        abs_cfg = os.path.abspath(cfg)
+        cfg_txt = self._validate_cfg_text(slot, abs_cfg)
+        if cfg_txt is None:
             return False
 
         await self._ensure_host_setup()
 
         try:
             killswitch_ok = await self._setup_slot_netns(slot)
-            sanitized_txt, is_tcp = _sanitize_ovpn_content(cfg_txt)
-            san_cfg = self._sanitized_cfg_path(slot)
-            with open(san_cfg, "w", encoding="utf-8", errors="replace") as fh:
-                fh.write(sanitized_txt)
-            log_path = self._log_path(slot)
-            ovpn_cmd = self._build_ovpn_cmd(slot, abs_cfg, self.auth_file, config_override=san_cfg, is_tcp=is_tcp)
-            log_fh = open(log_path, "w", encoding="utf-8", errors="replace")
-            try:
-                ovpn_proc = await asyncio.create_subprocess_exec(
-                    "ip", "netns", "exec", f"ovns{slot}", *ovpn_cmd,
-                    stdin=asyncio.subprocess.DEVNULL,
-                    stdout=log_fh,
-                    stderr=asyncio.subprocess.STDOUT,
-                )
-            finally:
-                log_fh.close()
-
-            procs = [ovpn_proc]
-            ms_proc: asyncio.subprocess.Process | None = None
-            if killswitch_ok:
-                ms_proc = await self._spawn_microsocks(slot)
-                procs.append(ms_proc)
-            self._slots[slot] = (abs_cfg, procs)
-
-            deadline = time.monotonic() + self.HANDSHAKE_TIMEOUT_S
-            ready = False
-            while time.monotonic() < deadline:
-                if ovpn_proc.returncode is not None:
-                    break
-                if ms_proc is not None and ms_proc.returncode is not None:
-                    break
-                log_txt = ""
-                if os.path.isfile(log_path):
-                    with open(log_path, "r", encoding="utf-8", errors="replace") as fh:
-                        log_txt = fh.read()
-                if "AUTH_FAILED" in log_txt:
-                    LOG.warning("slot %d auth failed for %s", slot, abs_cfg)
-                    break
-                if "Initialization Sequence Completed" in log_txt:
-                    pids, tun_up = await asyncio.gather(self._netns_pids(slot), self._tun_is_up(slot))
-                    if ovpn_proc.returncode is None and ovpn_proc.pid in set(pids) and tun_up:
-                        ready = True
-                        break
-                await asyncio.sleep(0.25)
-
-            if not ready:
-                await self.stop_slot(slot)
-                return False
-
-            if ms_proc is None:
-                # Deferred kill-switch fallback: drop non-VPN default route and isolate host /30 gateway once tun0 is up.
-                await self._run(
-                    "ip", "-n", f"ovns{slot}", "route", "del",
-                    "default", "via", f"198.18.{slot}.1", "dev", f"ovw{slot}",
-                )
-                for fb_cmd in self._fallback_host_drop_cmds(slot):
-                    await self._run(*fb_cmd)
-                ms_proc = await self._spawn_microsocks(slot)
-                procs.append(ms_proc)
-            if not await self._wait_tcp_ready(f"198.18.{slot}.2", 1080, ms_proc, timeout_s=1.0):
-                await self.stop_slot(slot)
-                return False
-
-            ok, rtt_ms, detail = await probe_socks_mt_api(f"198.18.{slot}.2", 1080)
+            self._slot_killswitch[slot] = killswitch_ok
+            ok = await self._launch_ovpn_and_probe(slot, abs_cfg, cfg_txt, None, killswitch_ok)
             if not ok:
-                LOG.warning("slot %d MT probe failed (%s, %dms) on %s", slot, detail, rtt_ms, abs_cfg)
                 await self.stop_slot(slot)
                 return False
-
-            self._watchers[slot] = asyncio.create_task(self._watch_ovpn_exit(slot, ovpn_proc, ms_proc))
             return True
         except asyncio.CancelledError:
             await self.stop_slot(slot)
@@ -661,8 +736,35 @@ class OvpnSlotManager:
             return False
 
     async def rotate_slot(self, slot: int, cfg: str) -> bool:
-        await self.stop_slot(slot)
-        return await self.start_slot(slot, cfg)
+        self._validate_slot(slot)
+        abs_cfg = os.path.abspath(cfg)
+        cfg_txt = self._validate_cfg_text(slot, abs_cfg)
+        if cfg_txt is None:
+            return False
+
+        ms_proc = await self._stop_openvpn_only(slot)
+        if ms_proc is None:
+            await self.stop_slot(slot)
+            return await self.start_slot(slot, cfg)
+
+        try:
+            ok = await self._launch_ovpn_and_probe(slot, abs_cfg, cfg_txt, ms_proc, True)
+            if not ok:
+                # Preserve existing netns + live microsocks for immediate next retry in _api_rotate.
+                reusable = await self._stop_openvpn_only(slot)
+                if reusable is None:
+                    await self.stop_slot(slot)
+                return False
+            return True
+        except asyncio.CancelledError:
+            await self.stop_slot(slot)
+            raise
+        except Exception as exc:
+            LOG.warning("slot %d rotate failed (%s): %s", slot, abs_cfg, exc)
+            reusable = await self._stop_openvpn_only(slot)
+            if reusable is None:
+                await self.stop_slot(slot)
+            return False
 
     async def stop_slots_batch(self, slots: list[int]) -> None:
         unique_slots = sorted({s for s in slots if 1 <= s <= self.MAX_SLOTS})
@@ -731,6 +833,7 @@ class OvpnSlotManager:
             with contextlib.suppress(FileNotFoundError):
                 os.remove(self._sanitized_cfg_path(s))
             self._slots.pop(s, None)
+            self._slot_killswitch.pop(s, None)
 
         await asyncio.gather(*(_cleanup_one(s) for s in unique_slots))
 
@@ -1006,6 +1109,7 @@ class GatewayServer:
     """HTTP Bearer-authenticated OpenVPN proxy lease gateway with TTL reaper."""
 
     COOLDOWN_S = 180.0
+    FAIL_COOLDOWN_S = 900.0
     MAX_BODY_BYTES = 65536
     REQUEST_TIMEOUT_S = 10.0
     LEASE_CONCURRENCY = 10
@@ -1024,10 +1128,11 @@ class GatewayServer:
         ttl_s: float = 180.0,
         slot_manager: Any | None = None,
         reap_interval_s: float = 15.0,
+        shuffle_configs: bool = False,
     ) -> None:
         validate_gateway_config(port, base_proxy_port, max_slots, ttl_s)
         self.ovpn_dir = ovpn_dir
-        self._configs, self._auth_file = discover_ovpn_configs(ovpn_dir)
+        self._configs, self._auth_file = discover_ovpn_configs(ovpn_dir, shuffle=shuffle_configs)
         if not self._configs:
             raise ValueError(f"No .ovpn configs found in {ovpn_dir}")
 
@@ -1117,9 +1222,10 @@ class GatewayServer:
             return False
         return hmac.compare_digest(parts[1].strip().encode("utf-8"), self._token_bytes)
 
-    def _mark_cooldown(self, cfg: str) -> None:
+    def _mark_cooldown(self, cfg: str, duration_s: float | None = None) -> None:
         if cfg:
-            self._cooldowns[cfg] = time.monotonic() + self.COOLDOWN_S
+            dur = self.COOLDOWN_S if duration_s is None else duration_s
+            self._cooldowns[cfg] = max(self._cooldowns.get(cfg, 0.0), time.monotonic() + dur)
 
     def _pick_next_config(self, exclude: set[str], allow_cooldown_fallback: bool) -> str | None:
         """Select unused .ovpn (UDP-first, non-cooldown first). Caller holds self._lock."""
@@ -1508,7 +1614,7 @@ class GatewayServer:
                         async with self._lock:
                             if self._reserved_cfgs.get(entry.slot) == cfg:
                                 self._reserved_cfgs.pop(entry.slot, None)
-                            self._mark_cooldown(cfg)
+                            self._mark_cooldown(cfg, self.FAIL_COOLDOWN_S)
                     abort_event.set()
                     return False
 
@@ -1626,16 +1732,20 @@ class GatewayServer:
             if old_bridge is not None:
                 await old_bridge.stop()
 
+            stop_err: tuple[int, dict[str, Any]] | None = None
             for _attempt in range(self.MAX_ROTATE_ATTEMPTS):
                 async with self._lock:
                     if self._stopping:
-                        return 503, {"ok": False, "error": "server shutting down"}
+                        stop_err = (503, {"ok": False, "error": "server shutting down"})
+                        break
                     lease = self._leases.get(lease_id)
                     if lease is None or lease.released:
-                        return 404, {"ok": False, "error": "lease closed"}
+                        stop_err = (404, {"ok": False, "error": "lease closed"})
+                        break
                     new_cfg = self._pick_next_config(attempted, allow_cooldown_fallback=False)
                     if new_cfg is None:
-                        return 503, {"ok": False, "error": "no unused off-cooldown .ovpn configs available"}
+                        stop_err = (503, {"ok": False, "error": "no unused off-cooldown .ovpn configs available"})
+                        break
                     attempted.add(new_cfg)
                     self._reserved_cfgs[entry.slot] = new_cfg
 
@@ -1675,8 +1785,12 @@ class GatewayServer:
                 async with self._lock:
                     if self._reserved_cfgs.get(entry.slot) == new_cfg:
                         self._reserved_cfgs.pop(entry.slot, None)
-                    self._mark_cooldown(new_cfg)
+                    self._mark_cooldown(new_cfg, self.FAIL_COOLDOWN_S)
 
+            with contextlib.suppress(Exception):
+                await self.slot_manager.stop_slot(entry.slot)
+            if stop_err is not None:
+                return stop_err
             if self._stopping:
                 return 503, {"ok": False, "error": "server shutting down"}
             return 503, {"ok": False, "error": "rotate failed after maximum attempts"}
@@ -1798,8 +1912,9 @@ async def _selftest_async() -> None:
             ["--data-ciphers-fallback", "AES-256-CBC"],
             ["--script-security", "1"],
             ["--ping-exit", "60"],
-            ["--connect-retry", "1", "2"],
-            ["--resolv-retry", "2"],
+            ["--hand-window", "8"],
+            ["--connect-retry", "1", "1"],
+            ["--resolv-retry", "1"],
             ["--mssfix", "1360", "--fast-io"],
             ["--auth-nocache"],
             ["--auth-user-pass", abs_auth],
@@ -2115,6 +2230,27 @@ async def _selftest_gateway_async() -> None:
         proc2.terminate()
         await proc2.wait()
         assert events == [], f"unexpected callback fired on clean cancel: {events}"
+
+        # _stop_openvpn_only kills only OpenVPN while keeping live microsocks without firing unexpected exit
+        events.clear()
+        ovpn_sub = await asyncio.create_subprocess_exec(sys.executable, "-c", "import time; time.sleep(5)")
+        ms_keep = await asyncio.create_subprocess_exec(sys.executable, "-c", "import time; time.sleep(5)")
+
+        async def _no_tun(slot: int) -> bool:
+            return False
+
+        mgr._tun_is_up = _no_tun  # type: ignore[method-assign]
+        mgr._slot_killswitch[5] = True
+        mgr._slots[5] = ("k.ovpn", [ovpn_sub, ms_keep])
+        w5 = asyncio.create_task(mgr._watch_ovpn_exit(5, ovpn_sub, ms_keep))
+        mgr._watchers[5] = w5
+        reused_ms = await mgr._stop_openvpn_only(5)
+        assert reused_ms is ms_keep and ovpn_sub.returncode is not None and ms_keep.returncode is None, (
+            reused_ms, ovpn_sub.returncode, ms_keep.returncode
+        )
+        assert events == [], f"unexpected exit callback during _stop_openvpn_only: {events}"
+        ms_keep.terminate()
+        await ms_keep.wait()
 
     # 8. GatewayServer full lifecycle with mocked OvpnSlotManager over real TCP HTTP
     class FakeSlotManager:
@@ -2569,6 +2705,7 @@ def main(argv: list[str] | None = None) -> int:
             max_slots=args.max_slots,
             public_ip=public_ip,
             ttl_s=args.ttl_s,
+            shuffle_configs=True,
         )
     except (FileNotFoundError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
