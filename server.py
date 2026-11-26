@@ -93,6 +93,47 @@ def discover_ovpn_configs(ovpn_dir: str, shuffle: bool = False) -> tuple[list[st
     return udp_cfgs + other_cfgs, auth_file
 
 
+def discover_multi_ovpn_configs(
+    ovpn_dirs: str | list[str],
+    shuffle: bool = False,
+    udp_only: bool = False,
+) -> tuple[list[str], dict[str, str], str]:
+    """Scan one or more ovpn dirs (comma/list separated) tracking per-config auth files."""
+    raw_items = [ovpn_dirs] if isinstance(ovpn_dirs, str) else list(ovpn_dirs)
+    dirs: list[str] = []
+    seen_dirs: set[str] = set()
+    for item in raw_items:
+        for part in str(item).split(","):
+            d = part.strip()
+            if not d:
+                continue
+            ad = os.path.abspath(d)
+            if ad not in seen_dirs:
+                seen_dirs.add(ad)
+                dirs.append(d)
+
+    udp_all: list[str] = []
+    other_all: list[str] = []
+    auth_map: dict[str, str] = {}
+    fallback_auth = ""
+    for d in dirs:
+        cfgs, d_auth = discover_ovpn_configs(d, shuffle=False)
+        abs_auth = os.path.abspath(d_auth) if d_auth else ""
+        if abs_auth and not fallback_auth:
+            fallback_auth = abs_auth
+        for p in cfgs:
+            abs_p = os.path.abspath(p)
+            if abs_auth:
+                auth_map[abs_p] = abs_auth
+            (udp_all if p.lower().endswith("udp.ovpn") else other_all).append(abs_p)
+
+    if shuffle:
+        random.shuffle(udp_all)
+        random.shuffle(other_all)
+    combined = udp_all if udp_only else (udp_all + other_all)
+    return combined, auth_map, fallback_auth
+
+
 def _probe_mt_response_ok(status: int) -> bool:
     """Return True iff HTTP status indicates reachable, unblocked MT API endpoint."""
     return 100 <= status < 500 and status not in (400, 402, 403, 405, 407, 429)
@@ -326,9 +367,15 @@ class OvpnSlotManager:
         auth_file: str = "",
         state_dir: str = "/tmp/ufasproxy",
         on_unexpected_exit: Callable[[int, str], Any] | None = None,
+        cfg_auth_map: dict[str, str] | None = None,
     ) -> None:
         self.ovpn_dir = ovpn_dir
         self.auth_file = os.path.abspath(auth_file) if auth_file else ""
+        self._cfg_auth = {
+            os.path.abspath(k): os.path.abspath(v)
+            for k, v in (cfg_auth_map or {}).items()
+            if v
+        }
         self.state_dir = os.path.abspath(state_dir)
         self._on_unexpected_exit = on_unexpected_exit
         self._slots: dict[int, tuple[str, list[asyncio.subprocess.Process]]] = {}
@@ -359,7 +406,7 @@ class OvpnSlotManager:
         self._validate_slot(slot)
         abs_cfg = os.path.abspath(cfg)
         cfg_arg = os.path.abspath(config_override) if config_override else abs_cfg
-        auth = auth_file or self.auth_file
+        auth = auth_file or self._cfg_auth.get(abs_cfg, self.auth_file)
         abs_auth = os.path.abspath(auth) if auth else ""
         tcp_mode = is_tcp if is_tcp is not None else bool(re.search(r"tcp", os.path.basename(abs_cfg), re.I))
         cmd = [
@@ -634,7 +681,8 @@ class OvpnSlotManager:
         with open(san_cfg, "w", encoding="utf-8", errors="replace") as fh:
             fh.write(sanitized_txt)
         log_path = self._log_path(slot)
-        ovpn_cmd = self._build_ovpn_cmd(slot, abs_cfg, self.auth_file, config_override=san_cfg, is_tcp=is_tcp)
+        cfg_auth = self._cfg_auth.get(abs_cfg, self.auth_file)
+        ovpn_cmd = self._build_ovpn_cmd(slot, abs_cfg, cfg_auth, config_override=san_cfg, is_tcp=is_tcp)
         log_fh = open(log_path, "w", encoding="utf-8", errors="replace")
         try:
             ovpn_proc = await asyncio.create_subprocess_exec(
@@ -707,7 +755,7 @@ class OvpnSlotManager:
             raise FileNotFoundError(f"ovpn config not found: {abs_cfg}")
         with open(abs_cfg, "r", encoding="utf-8", errors="replace") as fh:
             cfg_txt = fh.read()
-        if not self.auth_file and re.search(r"(?im)^[ \t]*auth-user-pass[ \t]*(?:#.*)?$", cfg_txt):
+        if not self._cfg_auth.get(abs_cfg, self.auth_file) and re.search(r"(?im)^[ \t]*auth-user-pass[ \t]*(?:#.*)?$", cfg_txt):
             LOG.warning("slot %d config %s has bare auth-user-pass without auth_file", slot, abs_cfg)
             return None
         return cfg_txt
@@ -1120,7 +1168,7 @@ class GatewayServer:
 
     def __init__(
         self,
-        ovpn_dir: str,
+        ovpn_dir: str | list[str],
         host: str = "0.0.0.0",
         port: int = 8080,
         token: str = "",
@@ -1131,10 +1179,13 @@ class GatewayServer:
         slot_manager: Any | None = None,
         reap_interval_s: float = 15.0,
         shuffle_configs: bool = False,
+        udp_only: bool = False,
     ) -> None:
         validate_gateway_config(port, base_proxy_port, max_slots, ttl_s)
-        self.ovpn_dir = ovpn_dir
-        self._configs, self._auth_file = discover_ovpn_configs(ovpn_dir, shuffle=shuffle_configs)
+        self.ovpn_dir = ovpn_dir if isinstance(ovpn_dir, str) else ",".join(ovpn_dir)
+        self._configs, self._cfg_auth, self._auth_file = discover_multi_ovpn_configs(
+            ovpn_dir, shuffle=shuffle_configs, udp_only=udp_only
+        )
         if not self._configs:
             raise ValueError(f"No .ovpn configs found in {ovpn_dir}")
 
@@ -1156,9 +1207,10 @@ class GatewayServer:
                 self.slot_manager._on_unexpected_exit = self._handle_unexpected_exit
         else:
             self.slot_manager = OvpnSlotManager(
-                ovpn_dir=ovpn_dir,
+                ovpn_dir=self.ovpn_dir,
                 auth_file=self._auth_file,
                 on_unexpected_exit=self._handle_unexpected_exit,
+                cfg_auth_map=self._cfg_auth,
             )
 
         self._lock = asyncio.Lock()
@@ -1168,6 +1220,7 @@ class GatewayServer:
         self._slot_owners: dict[int, str] = {}
         self._reserved_cfgs: dict[int, str] = {}
         self._cooldowns: dict[str, float] = {}
+        self._rr_idx = 0
         self._server: asyncio.AbstractServer | None = None
         self._reaper_task: asyncio.Task[None] | None = None
         self._client_tasks: set[asyncio.Task[None]] = set()
@@ -1230,18 +1283,30 @@ class GatewayServer:
             self._cooldowns[cfg] = max(self._cooldowns.get(cfg, 0.0), time.monotonic() + dur)
 
     def _pick_next_config(self, exclude: set[str], allow_cooldown_fallback: bool) -> str | None:
-        """Select unused .ovpn (UDP-first, non-cooldown first). Caller holds self._lock."""
+        """Select unused .ovpn round-robin from _rr_idx (off-cooldown first). Caller holds self._lock."""
         now = time.monotonic()
         used = set(self._reserved_cfgs.values()) | exclude
-        candidates = [c for c in self._configs if c not in used]
-        if not candidates:
+        n = len(self._configs)
+        if n == 0:
             return None
-        fresh = [c for c in candidates if self._cooldowns.get(c, 0.0) <= now]
-        if fresh:
-            return fresh[0]
+        for off in range(n):
+            idx = (self._rr_idx + off) % n
+            c = self._configs[idx]
+            if c not in used and self._cooldowns.get(c, 0.0) <= now:
+                self._rr_idx = (idx + 1) % n
+                return c
         if not allow_cooldown_fallback:
             return None
-        return min(candidates, key=lambda c: self._cooldowns.get(c, 0.0))
+        avail = [
+            ((self._rr_idx + off) % n, self._configs[(self._rr_idx + off) % n])
+            for off in range(n)
+            if self._configs[(self._rr_idx + off) % n] not in used
+        ]
+        if not avail:
+            return None
+        best_i, best_c = min(avail, key=lambda ic: self._cooldowns.get(ic[1], 0.0))
+        self._rr_idx = (best_i + 1) % n
+        return best_c
 
     async def _handle_unexpected_exit(self, slot: int, cfg: str) -> None:
         lock = self._slot_locks.get(slot)
@@ -2623,6 +2688,7 @@ async def _selftest_gateway_async() -> None:
                         len(cap_mgr.start_calls),
                     )
                     gw_cap._cooldowns.clear()
+                    gw_cap._rr_idx = 0
                     cap_mgr.fail_cfgs.discard("cfg_00_udp.ovpn")
                     cap_st2, cap_lease = await gw_cap._api_lease({"count": 1})
                     assert cap_st2 == 200, (cap_st2, cap_lease)
@@ -2635,6 +2701,56 @@ async def _selftest_gateway_async() -> None:
                     )
                 finally:
                     await gw_cap.stop()
+
+            # Multi-dir discovery (per-dir auth_file) + true round-robin cycling across all configs
+            with tempfile.TemporaryDirectory() as d_a, tempfile.TemporaryDirectory() as d_b:
+                for p in (d_a, d_b):
+                    with open(os.path.join(p, "auth.txt"), "w", encoding="utf-8") as fh:
+                        fh.write(f"user_{os.path.basename(p)}\npass\n")
+                with open(os.path.join(d_a, "s1_udp.ovpn"), "w", encoding="utf-8") as fh:
+                    fh.write("client\n")
+                with open(os.path.join(d_b, "p1.udp.ovpn"), "w", encoding="utf-8") as fh:
+                    fh.write("client\n")
+                with open(os.path.join(d_b, "p2.tcp.ovpn"), "w", encoding="utf-8") as fh:
+                    fh.write("client\nproto tcp\n")
+
+                cfgs_m, auth_m, _ = discover_multi_ovpn_configs([d_a, d_b], shuffle=False, udp_only=True)
+                assert [os.path.basename(x) for x in cfgs_m] == ["s1_udp.ovpn", "p1.udp.ovpn"], cfgs_m
+                assert auth_m[cfgs_m[0]] != auth_m[cfgs_m[1]], auth_m
+                mgr_m = OvpnSlotManager(cfg_auth_map=auth_m)
+                cmd_a = mgr_m._build_ovpn_cmd(1, cfgs_m[0])
+                cmd_b = mgr_m._build_ovpn_cmd(1, cfgs_m[1])
+                assert cmd_a[cmd_a.index("--auth-user-pass") + 1] == auth_m[cfgs_m[0]]
+                assert cmd_b[cmd_b.index("--auth-user-pass") + 1] == auth_m[cfgs_m[1]]
+
+                # Round-robin must advance cursor past c0 even after c0 cooldown expires
+                for idx_c in range(3):
+                    with open(os.path.join(d_a, f"rr_{idx_c}_udp.ovpn"), "w", encoding="utf-8") as fh:
+                        fh.write("client\n")
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s_rr:
+                    s_rr.bind(("127.0.0.1", 0))
+                    rr_proxy_port = s_rr.getsockname()[1]
+                rr_mgr = FakeSlotManager()
+                gw_rr = GatewayServer(
+                    ovpn_dir=d_a,
+                    host="127.0.0.1",
+                    port=19996 if rr_proxy_port != 19996 else 19995,
+                    token=token,
+                    base_proxy_port=rr_proxy_port,
+                    max_slots=1,
+                    public_ip="127.0.0.1",
+                    slot_manager=rr_mgr,
+                )
+                try:
+                    picks = []
+                    for _ in range(len(gw_rr._configs)):
+                        picked = gw_rr._pick_next_config(set(), allow_cooldown_fallback=False)
+                        assert picked is not None
+                        gw_rr._mark_cooldown(picked, 0.0)
+                        picks.append(os.path.basename(picked))
+                    assert len(set(picks)) == len(gw_rr._configs), f"not round-robin: {picks}"
+                finally:
+                    await gw_rr.stop()
         finally:
             await gw.stop()
             assert fake_mgr.stop_all_calls + (fake_mgr2.stop_all_calls if "fake_mgr2" in locals() else 0) >= 1
@@ -2664,7 +2780,8 @@ async def _serve_forever(gw: GatewayServer) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="ufasproxy OpenVPN proxy gateway")
-    parser.add_argument("--ovpn-dir", default="", help="Directory containing *.ovpn configs and auth.txt")
+    parser.add_argument("--ovpn-dir", nargs="+", default=[], help="One or more dirs containing *.ovpn and auth.txt (or comma-separated)")
+    parser.add_argument("--udp-only", action="store_true", help="Use only UDP .ovpn configs when available (skip slow TCP configs)")
     parser.add_argument("--host", default="0.0.0.0", help="API & proxy bind address (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=8080, help="HTTP API port (default: 8080, must be > 1024)")
     parser.add_argument("--token", default="", help="Bearer auth token (env: UFASPROXY_TOKEN; auto-generated if empty)")
@@ -2709,6 +2826,7 @@ def main(argv: list[str] | None = None) -> int:
             public_ip=public_ip,
             ttl_s=args.ttl_s,
             shuffle_configs=True,
+            udp_only=args.udp_only,
         )
     except (FileNotFoundError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
