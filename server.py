@@ -1157,8 +1157,8 @@ class _Lease:
 class GatewayServer:
     """HTTP Bearer-authenticated OpenVPN proxy lease gateway with TTL reaper."""
 
-    COOLDOWN_S = 180.0
-    FAIL_COOLDOWN_S = 1800.0
+    COOLDOWN_S = 21600.0
+    FAIL_COOLDOWN_S = 21600.0
     MAX_BODY_BYTES = 65536
     REQUEST_TIMEOUT_S = 10.0
     LEASE_CONCURRENCY = 6
@@ -1809,9 +1809,9 @@ class GatewayServer:
                     if lease is None or lease.released:
                         stop_err = (404, {"ok": False, "error": "lease closed"})
                         break
-                    new_cfg = self._pick_next_config(attempted, allow_cooldown_fallback=False)
+                    new_cfg = self._pick_next_config(attempted, allow_cooldown_fallback=True)
                     if new_cfg is None:
-                        stop_err = (503, {"ok": False, "error": "no unused off-cooldown .ovpn configs available"})
+                        stop_err = (503, {"ok": False, "error": "no unused .ovpn configs available"})
                         break
                     attempted.add(new_cfg)
                     self._reserved_cfgs[entry.slot] = new_cfg
@@ -2761,6 +2761,20 @@ async def _selftest_gateway_async() -> None:
                         gw_rr._mark_cooldown(picked, 0.0)
                         picks.append(os.path.basename(picked))
                     assert len(set(picks)) == len(gw_rr._configs), f"not round-robin: {picks}"
+
+                    # 6h quarantine on flagged configs: untouched configs come first, then least remaining cooldown
+                    assert GatewayServer.COOLDOWN_S == 21600.0
+                    now_q = time.monotonic()
+                    gw_rr._cooldowns.clear()
+                    gw_rr._rr_idx = 0
+                    for idx_q, cfg_q in enumerate(gw_rr._configs[:-1]):
+                        gw_rr._cooldowns[cfg_q] = now_q + 21600.0 - (idx_q * 100.0)
+                    # Wait: only last config is unflagged -> must be picked first
+                    assert gw_rr._pick_next_config(set(), allow_cooldown_fallback=True) == gw_rr._configs[-1]
+                    # Now flag the last config too -> must fall back to the one with least remaining time (highest idx_q)
+                    gw_rr._cooldowns[gw_rr._configs[-1]] = now_q + 21600.0
+                    least_rem = gw_rr._pick_next_config(set(), allow_cooldown_fallback=True)
+                    assert least_rem == gw_rr._configs[-2], (least_rem, gw_rr._configs[-2])
                 finally:
                     await gw_rr.stop()
         finally:
