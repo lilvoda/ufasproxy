@@ -123,8 +123,7 @@ def discover_multi_ovpn_configs(
             fallback_auth = abs_auth
         for p in cfgs:
             abs_p = os.path.abspath(p)
-            if abs_auth:
-                auth_map[abs_p] = abs_auth
+            auth_map[abs_p] = abs_auth
             (udp_all if p.lower().endswith("udp.ovpn") else other_all).append(abs_p)
 
     if shuffle:
@@ -372,9 +371,8 @@ class OvpnSlotManager:
         self.ovpn_dir = ovpn_dir
         self.auth_file = os.path.abspath(auth_file) if auth_file else ""
         self._cfg_auth = {
-            os.path.abspath(k): os.path.abspath(v)
+            os.path.abspath(k): (os.path.abspath(v) if v else "")
             for k, v in (cfg_auth_map or {}).items()
-            if v
         }
         self.state_dir = os.path.abspath(state_dir)
         self._on_unexpected_exit = on_unexpected_exit
@@ -423,6 +421,7 @@ class OvpnSlotManager:
             "--script-security", "1",
             "--ping-exit", "180",
             "--hand-window", "8",
+            "--server-poll-timeout", "3",
             "--connect-retry", "1", "1",
             "--resolv-retry", "1",
             "--auth-nocache",
@@ -1981,6 +1980,7 @@ async def _selftest_async() -> None:
             ["--script-security", "1"],
             ["--ping-exit", "180"],
             ["--hand-window", "8"],
+            ["--server-poll-timeout", "3"],
             ["--connect-retry", "1", "1"],
             ["--resolv-retry", "1"],
             ["--mssfix", "1360", "--fast-io"],
@@ -2722,6 +2722,18 @@ async def _selftest_gateway_async() -> None:
                 cmd_b = mgr_m._build_ovpn_cmd(1, cfgs_m[1])
                 assert cmd_a[cmd_a.index("--auth-user-pass") + 1] == auth_m[cfgs_m[0]]
                 assert cmd_b[cmd_b.index("--auth-user-pass") + 1] == auth_m[cfgs_m[1]]
+
+                # Dir without auth.txt must NOT inherit another dir's auth.txt (cross-dir credential isolation)
+                with tempfile.TemporaryDirectory() as d_noauth:
+                    noauth_cfg = os.path.join(d_noauth, "n1_udp.ovpn")
+                    with open(noauth_cfg, "w", encoding="utf-8") as fh:
+                        fh.write("client\nauth-user-pass\n")
+                    cfgs_iso, auth_iso, fb_iso = discover_multi_ovpn_configs([d_a, d_noauth], shuffle=False, udp_only=True)
+                    assert fb_iso == os.path.abspath(os.path.join(d_a, "auth.txt")), fb_iso
+                    assert auth_iso[os.path.abspath(noauth_cfg)] == "", auth_iso
+                    mgr_iso = OvpnSlotManager(auth_file=fb_iso, cfg_auth_map=auth_iso)
+                    assert mgr_iso._validate_cfg_text(1, os.path.abspath(noauth_cfg)) is None
+                    assert "--auth-user-pass" not in mgr_iso._build_ovpn_cmd(1, os.path.abspath(noauth_cfg))
 
                 # Round-robin must advance cursor past c0 even after c0 cooldown expires
                 for idx_c in range(3):
