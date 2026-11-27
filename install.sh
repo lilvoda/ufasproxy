@@ -4,14 +4,19 @@ set -euo pipefail
 export PATH="$PATH:/usr/sbin:/sbin"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
+DEFAULT_URL="http://168.144.36.170:8080"
+DEFAULT_TOKEN="bN7X9l38hw-O-lL1iyBHZWPauPBc3jwM"
+
 MODE=""
 ARG_URL="${UFASPROXY_URL:-}"
 ARG_TOKEN="${UFASPROXY_TOKEN:-}"
+ROLL_TOKEN=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --client|-c) MODE="client"; shift ;;
-    --server|-s) MODE="server"; shift ;;
-    --all|-a)    MODE="all"; shift ;;
+    --client|-c)  MODE="client"; shift ;;
+    --server|-s)  MODE="server"; shift ;;
+    --all|-a)     MODE="all"; shift ;;
+    --roll-token) ROLL_TOKEN=1; shift ;;
     --url)
       [[ $# -ge 2 ]] || { echo "Error: --url requires a value" >&2; exit 1; }
       ARG_URL="$2"; shift 2 ;;
@@ -19,7 +24,7 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || { echo "Error: --token requires a value" >&2; exit 1; }
       ARG_TOKEN="$2"; shift 2 ;;
     -h|--help)
-      echo "Usage: bash install.sh [--client | --server | --all] [--url URL] [--token TOKEN]"
+      echo "Usage: bash install.sh [--client | --server | --all] [--url URL] [--token TOKEN] [--roll-token]"
       exit 0
       ;;
     *)
@@ -150,26 +155,28 @@ install_server() {
   pub_ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
   [[ -n "$pub_ip" ]] || pub_ip="<GATEWAY_IP>"
 
-  srv_url="$ARG_URL"
-  if [[ -z "$srv_url" && -z "$(_read_env_val UFASPROXY_URL)" && "$pub_ip" != "<GATEWAY_IP>" ]]; then
-    srv_url="http://${pub_ip}:8080"
-  fi
-  srv_tok="$ARG_TOKEN"
-  if [[ -z "$srv_tok" ]]; then
-    srv_tok="$(_read_env_val UFASPROXY_TOKEN)"
-  fi
-  if [[ -z "$srv_tok" ]]; then
+  srv_url="${ARG_URL:-$([[ "$pub_ip" != "<GATEWAY_IP>" ]] && echo "http://${pub_ip}:8080" || echo "$DEFAULT_URL")}"
+  if [[ -n "$ARG_TOKEN" ]]; then
+    srv_tok="$ARG_TOKEN"
+  elif [[ "$ROLL_TOKEN" -eq 1 ]]; then
     srv_tok="$(python3 -c "import secrets; print(secrets.token_urlsafe(24))")"
+  else
+    srv_tok="$(_read_env_val UFASPROXY_TOKEN)"
+    [[ -n "$srv_tok" ]] || srv_tok="$DEFAULT_TOKEN"
   fi
   write_token_env "$srv_url" "$srv_tok"
+  ARG_URL="$(_read_env_val UFASPROXY_URL)"
+  ARG_TOKEN="$(_read_env_val UFASPROXY_TOKEN)"
 
   cat <<EOF
 
 [OK] ufasproxy SERVER prerequisites verified!
 Saved gateway URL/token -> $TOKEN_FILE (chmod 600)
 Start the gateway with:
-  sudo env UFASPROXY_TOKEN="$srv_tok" python3 "$SCRIPT_DIR/server.py" --ovpn-dir /path/to/vpns-surfshark --udp-only --port 8080 --public-ip "$pub_ip"
-Optional: multiple --ovpn-dir paths, --base-proxy-port 20001, --max-slots 45, --ttl-s 180
+  sudo env UFASPROXY_TOKEN="$ARG_TOKEN" python3 "$SCRIPT_DIR/server.py" --ovpn-dir /path/to/vpns-surfshark --udp-only --port 8080 --public-ip "$pub_ip"
+Sync other clients to this server with:
+  bash install.sh --client --url "$ARG_URL" --token "$ARG_TOKEN"
+Optional: --roll-token (new random token), multiple --ovpn-dir paths, --base-proxy-port 20001, --max-slots 45, --ttl-s 180
 EOF
 }
 
@@ -211,41 +218,20 @@ install_client() {
   echo "[4/4] Running old_browser_vpn.py --selftest..."
   "$vpy" "$SCRIPT_DIR/old_browser_vpn.py" --selftest
 
-  local cli_url cli_tok cur_u cur_t def_u
-  cur_u="$(_read_env_val UFASPROXY_URL)"
-  cur_t="$(_read_env_val UFASPROXY_TOKEN)"
-  cli_url="${ARG_URL:-$cur_u}"
-  cli_tok="${ARG_TOKEN:-$cur_t}"
-  if [[ -t 0 ]] && [[ -z "$cli_url" || -z "$cli_tok" ]]; then
-    def_u="${cli_url:-$([[ "$MODE" == "all" ]] && echo "http://127.0.0.1:8080" || echo "")}"
-    if [[ -z "$cli_url" ]]; then
-      read -r -p "URL gateway ufasproxy [${def_u:-http://IP:8080}]: " _in_u || true
-      cli_url="${_in_u:-$def_u}"
-    fi
-    if [[ -z "$cli_tok" ]]; then
-      read -r -p "Bearer token ufasproxy: " _in_t || true
-      cli_tok="$_in_t"
-    fi
-  fi
-  if [[ -n "$cli_url" || -n "$cli_tok" ]]; then
-    write_token_env "$cli_url" "$cli_tok"
-    echo "[*] Konfigurasi API disimpan -> $TOKEN_FILE"
-  else
-    echo "[!] token.env belum terisi — jalankan ulang dengan --url <URL> --token <TOKEN> atau isi $TOKEN_FILE" >&2
-  fi
+  local cli_url cli_tok
+  cli_url="${ARG_URL:-$DEFAULT_URL}"
+  cli_tok="${ARG_TOKEN:-$DEFAULT_TOKEN}"
+  write_token_env "$cli_url" "$cli_tok"
+  echo "[*] Konfigurasi API disimpan -> $TOKEN_FILE"
 
   cat <<EOF
 
 [OK] ufasproxy CLIENT ready!
-EOF
-  if [[ -s "$TOKEN_FILE" ]]; then
-    echo "API config ready in $TOKEN_FILE; run:"
-  else
-    echo "Set $TOKEN_FILE (UFASPROXY_URL & UFASPROXY_TOKEN) then run:"
-  fi
-  cat <<EOF
+API config ready in $TOKEN_FILE; run:
   source "$SCRIPT_DIR/.venv/bin/activate"
   python "$SCRIPT_DIR/old_browser_vpn.py" -c "$SCRIPT_DIR/input/<combo>.txt" -w auto
+Tip: jika pindah server/token nanti, jalankan:
+  bash install.sh --client --url http://<IP_BARU>:8080 --token <TOKEN_BARU>
 EOF
 }
 
