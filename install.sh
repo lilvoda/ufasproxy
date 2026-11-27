@@ -105,8 +105,8 @@ install_server() {
 
 [OK] ufasproxy SERVER prerequisites verified!
 Start the gateway with:
-  sudo python3 "$SCRIPT_DIR/server.py" --ovpn-dir /path/to/vpns-surfshark --port 8080 --public-ip "$pub_ip"
-Optional: --token "<SECRET>" (or set UFASPROXY_TOKEN), --base-proxy-port 20001, --max-slots 45, --ttl-s 180
+  sudo python3 "$SCRIPT_DIR/server.py" --ovpn-dir /path/to/vpns-surfshark --udp-only --port 8080 --public-ip "$pub_ip"
+Optional: multiple --ovpn-dir paths, --token "<SECRET>" (or UFASPROXY_TOKEN), --base-proxy-port 20001, --max-slots 45, --ttl-s 180
 EOF
 }
 
@@ -123,7 +123,8 @@ install_client() {
   fi
 
   echo "[2/4] Setting up .venv and Python packages..."
-  if [[ ! -f "$SCRIPT_DIR/.venv/bin/activate" ]]; then
+  if [[ ! -x "$SCRIPT_DIR/.venv/bin/python" ]] || ! "$SCRIPT_DIR/.venv/bin/python" -m pip --version >/dev/null 2>&1; then
+    rm -rf "$SCRIPT_DIR/.venv"
     python3 -m venv "$SCRIPT_DIR/.venv"
   fi
   local vpy="$SCRIPT_DIR/.venv/bin/python"
@@ -133,9 +134,9 @@ install_client() {
   echo "[3/4] Installing Chromium OS dependencies & CloakBrowser binary..."
   if [[ "$(uname -s)" = "Linux" ]]; then
     if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
-      "$vpy" -m playwright install-deps chromium
+      env DEBIAN_FRONTEND=noninteractive "$vpy" -m playwright install-deps chromium
     elif [[ -n "$SUDO" && "$SUDO" != "__NEED_ROOT__" ]]; then
-      $SUDO env "PATH=$PATH" "$vpy" -m playwright install-deps chromium
+      $SUDO env "PATH=$PATH" DEBIAN_FRONTEND=noninteractive "$vpy" -m playwright install-deps chromium
     else
       echo "Error: root/sudo required for playwright install-deps chromium" >&2
       exit 1
@@ -152,7 +153,7 @@ install_client() {
 [OK] ufasproxy CLIENT ready!
 Set $SCRIPT_DIR/token.env (UFASPROXY_URL & UFASPROXY_TOKEN) then run:
   source "$SCRIPT_DIR/.venv/bin/activate"
-  python "$SCRIPT_DIR/old_browser_vpn.py" -c "$SCRIPT_DIR/input/koi.txt" -w auto
+  python "$SCRIPT_DIR/old_browser_vpn.py" -c "$SCRIPT_DIR/input/<combo>.txt" -w auto
 EOF
 }
 
