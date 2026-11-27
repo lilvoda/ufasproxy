@@ -95,6 +95,21 @@ def discover_ovpn_configs(ovpn_dir: str, shuffle: bool = False) -> tuple[list[st
     return udp_cfgs + other_cfgs, auth_file
 
 
+def _ovpn_is_udp(path: str) -> bool:
+    """Return True if .ovpn uses UDP (by filename suffix or inspecting proto directive)."""
+    low = os.path.basename(path).lower()
+    if low.endswith("udp.ovpn"):
+        return True
+    if low.endswith("tcp.ovpn"):
+        return False
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+            head = fh.read(1024)
+        return not bool(re.search(r"(?im)^[ \t]*proto[ \t]+tcp", head))
+    except OSError:
+        return False
+
+
 def discover_multi_ovpn_configs(
     ovpn_dirs: str | list[str],
     shuffle: bool = False,
@@ -126,7 +141,7 @@ def discover_multi_ovpn_configs(
         for p in cfgs:
             abs_p = os.path.abspath(p)
             auth_map[abs_p] = abs_auth
-            (udp_all if p.lower().endswith("udp.ovpn") else other_all).append(abs_p)
+            (udp_all if _ovpn_is_udp(abs_p) else other_all).append(abs_p)
 
     if shuffle:
         random.shuffle(udp_all)
@@ -336,7 +351,7 @@ def _nobody_uid_gid() -> tuple[int, int]:
 _OVPN_STRIP_DIRECTIVES = {
     "up", "down", "down-pre", "route-up", "route-pre-down",
     "ipchange", "tls-verify", "plugin", "script-security",
-    "block-outside-dns", "ncp-disable",
+    "block-outside-dns", "ncp-disable", "keysize",
 }
 
 
@@ -446,7 +461,7 @@ class OvpnSlotManager:
             "--pull-filter", "ignore", "ping-restart",
             "--pull-filter", "ignore", "ifconfig-ipv6",
             "--pull-filter", "ignore", "route-ipv6",
-            "--data-ciphers", "AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305:AES-256-CBC",
+            "--data-ciphers", "AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305:AES-256-CBC:AES-128-CBC",
             "--data-ciphers-fallback", "AES-256-CBC",
             "--script-security", "1",
             "--ping-exit", "90",
@@ -2050,7 +2065,7 @@ async def _selftest_async() -> None:
             ["--pull-filter", "ignore", "ping-restart"],
             ["--pull-filter", "ignore", "ifconfig-ipv6"],
             ["--pull-filter", "ignore", "route-ipv6"],
-            ["--data-ciphers", "AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305:AES-256-CBC"],
+            ["--data-ciphers", "AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305:AES-256-CBC:AES-128-CBC"],
             ["--data-ciphers-fallback", "AES-256-CBC"],
             ["--script-security", "1"],
             ["--ping-exit", "90"],
@@ -2066,9 +2081,9 @@ async def _selftest_async() -> None:
             assert pos >= 0, f"missing {required} after --config in {cmd}"
 
         san_txt, san_tcp = _sanitize_ovpn_content(
-            "client\nproto tcp6-client\nscript-security 2\nup /etc/openvpn/update-resolv-conf\ndown /etc/openvpn/update-resolv-conf\nblock-outside-dns\nncp-disable\nremote 1.2.3.4 443\n"
+            "client\nproto tcp6-client\nscript-security 2\nup /etc/openvpn/update-resolv-conf\ndown /etc/openvpn/update-resolv-conf\nblock-outside-dns\nncp-disable\nkeysize 256\nremote 1.2.3.4 443\n"
         )
-        assert san_tcp is True and "update-resolv-conf" not in san_txt and "script-security" not in san_txt and "ncp-disable" not in san_txt
+        assert san_tcp is True and "update-resolv-conf" not in san_txt and "script-security" not in san_txt and "ncp-disable" not in san_txt and "keysize" not in san_txt
         cmd_tcp = mgr._build_ovpn_cmd(3, os.path.join(tmp, "b_tcp.ovpn"), auth2, is_tcp=True)
         assert "--fast-io" not in cmd_tcp and "--mssfix" not in cmd_tcp, cmd_tcp
         fb_cmds = mgr._fallback_host_drop_cmds(3)
@@ -2797,9 +2812,13 @@ async def _selftest_gateway_async() -> None:
                     fh.write("client\n")
                 with open(os.path.join(d_b, "p2.tcp.ovpn"), "w", encoding="utf-8") as fh:
                     fh.write("client\nproto tcp\n")
+                with open(os.path.join(d_b, "pia_albania.ovpn"), "w", encoding="utf-8") as fh:
+                    fh.write("client\nproto udp\n")
+                with open(os.path.join(d_b, "ipv_tcp.ovpn"), "w", encoding="utf-8") as fh:
+                    fh.write("client\nproto tcp\n")
 
                 cfgs_m, auth_m, _ = discover_multi_ovpn_configs([d_a, d_b], shuffle=False, udp_only=True)
-                assert [os.path.basename(x) for x in cfgs_m] == ["s1_udp.ovpn", "p1.udp.ovpn"], cfgs_m
+                assert [os.path.basename(x) for x in cfgs_m] == ["s1_udp.ovpn", "p1.udp.ovpn", "pia_albania.ovpn"], cfgs_m
                 assert auth_m[cfgs_m[0]] != auth_m[cfgs_m[1]], auth_m
                 mgr_m = OvpnSlotManager(cfg_auth_map=auth_m)
                 cmd_a = mgr_m._build_ovpn_cmd(1, cfgs_m[0])
