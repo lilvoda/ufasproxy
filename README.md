@@ -10,10 +10,11 @@ On-demand OpenVPN-to-Proxy API Gateway (`http://user:pass@host:port`) untuk work
 ## Quick Start
 ### 1. Gateway Server (Linux / VPS)
 ```bash
-sudo bash install.sh --server
+sudo bash install.sh --server --tg-token "<BOT_TOKEN>" --tg-chat-id "<CHAT_ID>"
 # Buka firewall port 8080/tcp (API) dan 20001:20045/tcp (proxy slots)
-sudo python3 server.py --ovpn-dir /path/to/vpns-surfshark --port 8080 --token "<SECRET>"
+sudo python3 server.py --ovpn-dir /path/to/vpns-surfshark --udp-only --port 8080
 ```
+*(Kredensial `UFASPROXY_TOKEN`, `UFASPROXY_TG_TOKEN`, `UFASPROXY_TG_CHAT_ID`, dan `UFASPROXY_TG_INTERVAL` tersimpan di `token.env` `chmod 600` dan otomatis dibaca `server.py` / `systemd EnvironmentFile`.)*
 
 ### 2. Client Checker (`old_browser_vpn.py` di CT / Worker)
 ```bash

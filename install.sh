@@ -10,8 +10,12 @@ DEFAULT_TOKEN="bN7X9l38hw-O-lL1iyBHZWPauPBc3jwM"
 MODE=""
 ARG_URL="${UFASPROXY_URL:-}"
 ARG_TOKEN="${UFASPROXY_TOKEN:-}"
+ARG_TG_TOKEN="${UFASPROXY_TG_TOKEN:-}"
+ARG_TG_CHAT_ID="${UFASPROXY_TG_CHAT_ID:-}"
+ARG_TG_INTERVAL="${UFASPROXY_TG_INTERVAL:-}"
 ROLL_TOKEN=0
 NO_GIT_PUSH=0
+DO_RESTART=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --client|-c)   MODE="client"; shift ;;
@@ -19,14 +23,24 @@ while [[ $# -gt 0 ]]; do
     --all|-a)      MODE="all"; shift ;;
     --roll-token)  ROLL_TOKEN=1; shift ;;
     --no-git-push) NO_GIT_PUSH=1; shift ;;
+    --restart)     DO_RESTART=1; shift ;;
     --url)
       [[ $# -ge 2 ]] || { echo "Error: --url requires a value" >&2; exit 1; }
       ARG_URL="$2"; shift 2 ;;
     --token)
       [[ $# -ge 2 ]] || { echo "Error: --token requires a value" >&2; exit 1; }
       ARG_TOKEN="$2"; shift 2 ;;
+    --tg-token)
+      [[ $# -ge 2 ]] || { echo "Error: --tg-token requires a value" >&2; exit 1; }
+      ARG_TG_TOKEN="$2"; shift 2 ;;
+    --tg-chat-id)
+      [[ $# -ge 2 ]] || { echo "Error: --tg-chat-id requires a value" >&2; exit 1; }
+      ARG_TG_CHAT_ID="$2"; shift 2 ;;
+    --tg-interval)
+      [[ $# -ge 2 ]] || { echo "Error: --tg-interval requires a value" >&2; exit 1; }
+      ARG_TG_INTERVAL="$2"; shift 2 ;;
     -h|--help)
-      echo "Usage: bash install.sh [--client | --server | --all] [--url URL] [--token TOKEN] [--roll-token] [--no-git-push]"
+      echo "Usage: bash install.sh [--client | --server | --all] [--url URL] [--token TOKEN] [--tg-token BOT_TOKEN] [--tg-chat-id CHAT_ID] [--tg-interval SEC] [--roll-token] [--no-git-push] [--restart]"
       exit 0
       ;;
     *)
@@ -112,19 +126,101 @@ _norm_url() {
 }
 
 write_token_env() {
-  local url token cur_u cur_t
+  local url token tg_tok tg_chat tg_int
+  local cur_u cur_t cur_tgt cur_tgc cur_tgi
   cur_u="$(_read_env_val UFASPROXY_URL)"
   cur_t="$(_read_env_val UFASPROXY_TOKEN)"
+  cur_tgt="$(_read_env_val UFASPROXY_TG_TOKEN)"
+  cur_tgc="$(_read_env_val UFASPROXY_TG_CHAT_ID)"
+  cur_tgi="$(_read_env_val UFASPROXY_TG_INTERVAL)"
   url="$(_norm_url "${1:-$cur_u}")"
   token="${2:-$cur_t}"
+  tg_tok="${3:-$cur_tgt}"
+  tg_chat="${4:-$cur_tgc}"
+  tg_int="${5:-$cur_tgi}"
   token="${token//$'\r'/}"
   token="${token//$'\n'/}"
+  tg_tok="${tg_tok//$'\r'/}"
+  tg_tok="${tg_tok//$'\n'/}"
+  tg_chat="${tg_chat//$'\r'/}"
+  tg_chat="${tg_chat//$'\n'/}"
+  tg_int="${tg_int//$'\r'/}"
+  tg_int="${tg_int//$'\n'/}"
+  local tmp_env
   umask 077
+  tmp_env="$(mktemp "$SCRIPT_DIR/.token.env.XXXXXX")"
   {
     [[ -n "$url" ]] && printf 'UFASPROXY_URL=%s\n' "$url"
     [[ -n "$token" ]] && printf 'UFASPROXY_TOKEN=%s\n' "$token"
-  } > "$TOKEN_FILE"
-  chmod 600 "$TOKEN_FILE" 2>/dev/null || true
+    [[ -n "$tg_tok" ]] && printf 'UFASPROXY_TG_TOKEN=%s\n' "$tg_tok"
+    [[ -n "$tg_chat" ]] && printf 'UFASPROXY_TG_CHAT_ID=%s\n' "$tg_chat"
+    [[ -n "$tg_int" ]] && printf 'UFASPROXY_TG_INTERVAL=%s\n' "$tg_int"
+    if [[ -f "$TOKEN_FILE" ]]; then
+      awk -F= '
+        $0 !~ /^[[:space:]]*$/ && $0 !~ /^[[:space:]]*#/ &&
+        $1 !~ /^[[:space:]]*(UFASPROXY_URL|UFASPROXY_TOKEN|UFASPROXY_TG_TOKEN|UFASPROXY_TG_CHAT_ID|UFASPROXY_TG_INTERVAL)[[:space:]]*$/ { print }
+      ' "$TOKEN_FILE"
+    fi
+  } > "$tmp_env"
+  chmod 600 "$tmp_env" 2>/dev/null || true
+  mv -f "$tmp_env" "$TOKEN_FILE"
+}
+
+sync_systemd_env() {
+  local unit_file="/etc/systemd/system/ufasproxy.service"
+  if [[ ! -f "$unit_file" || "$SUDO" == "__NEED_ROOT__" ]]; then
+    if [[ "$DO_RESTART" -eq 1 ]]; then
+      echo "[!] --restart diabaikan ($unit_file tidak ditemukan atau bukan root)" >&2
+    fi
+    return 0
+  fi
+  if ! command -v systemctl >/dev/null 2>&1 || [[ ! -d /run/systemd/system ]]; then
+    if [[ "$DO_RESTART" -eq 1 ]]; then
+      echo "[!] --restart diabaikan (systemd belum aktif di host/container ini)" >&2
+    fi
+    return 0
+  fi
+  local changed
+  changed="$($SUDO env UNIT_FILE="$unit_file" ENV_FILE="$TOKEN_FILE" python3 - << 'PY'
+import os, tempfile
+unit_p = os.environ["UNIT_FILE"]
+env_p = os.environ["ENV_FILE"]
+txt = open(unit_p, "r", encoding="utf-8").read()
+lines = txt.splitlines(keepends=True)
+if any(l.strip().startswith("EnvironmentFile=") and env_p in l for l in lines):
+    print("0")
+    raise SystemExit(0)
+out, inserted = [], False
+for l in lines:
+    out.append(l)
+    if not inserted and l.strip() == "[Service]":
+        out.append(f"EnvironmentFile=-{env_p}\n")
+        inserted = True
+if inserted:
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(unit_p), prefix=".ufp_unit_")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            fh.writelines(out)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, unit_p)
+    except Exception:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+    print("1")
+else:
+    print("0")
+PY
+  )"
+  $SUDO systemctl daemon-reload
+  if [[ "$changed" == "1" ]]; then
+    echo "[*] Added EnvironmentFile=-$TOKEN_FILE to $unit_file"
+  fi
+  if [[ "$DO_RESTART" -eq 1 ]]; then
+    echo "[*] Restarting ufasproxy.service..."
+    $SUDO systemctl restart ufasproxy
+    $SUDO systemctl --no-pager -l status ufasproxy | head -n 12 || true
+  fi
 }
 
 sync_defaults_to_github() {
@@ -214,7 +310,7 @@ install_server() {
   echo "[4/4] Running server.py --selftest..."
   python3 "$SCRIPT_DIR/server.py" --selftest
 
-  local pub_ip srv_url srv_tok
+  local pub_ip srv_url srv_tok tg_tok tg_chat tg_int
   pub_ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
   [[ -n "$pub_ip" ]] || pub_ip="<GATEWAY_IP>"
 
@@ -227,21 +323,69 @@ install_server() {
     srv_tok="$(_read_env_val UFASPROXY_TOKEN)"
     [[ -n "$srv_tok" ]] || srv_tok="$DEFAULT_TOKEN"
   fi
-  write_token_env "$srv_url" "$srv_tok"
+
+  local cur_tgt cur_tgc cur_tgi
+  cur_tgt="$(_read_env_val UFASPROXY_TG_TOKEN)"
+  cur_tgc="$(_read_env_val UFASPROXY_TG_CHAT_ID)"
+  cur_tgi="$(_read_env_val UFASPROXY_TG_INTERVAL)"
+  tg_tok="${ARG_TG_TOKEN:-$cur_tgt}"
+  tg_chat="${ARG_TG_CHAT_ID:-$cur_tgc}"
+  tg_int="${ARG_TG_INTERVAL:-$cur_tgi}"
+
+  if [[ -t 0 ]]; then
+    if [[ -z "$ARG_TG_TOKEN" ]]; then
+      local _tgt_hint=""
+      [[ -n "$cur_tgt" ]] && _tgt_hint=" [tersimpan, Enter untuk pertahankan]"
+      read -r -s -p "Telegram Bot Token live status${_tgt_hint}: " _in_tgt || true
+      echo ""
+      [[ -n "${_in_tgt:-}" ]] && tg_tok="$_in_tgt"
+    fi
+    if [[ -n "$tg_tok" && -z "$ARG_TG_CHAT_ID" ]]; then
+      read -r -p "Telegram Chat ID [${tg_chat:-wajib jika pakai bot}]: " _in_tgc || true
+      [[ -n "${_in_tgc:-}" ]] && tg_chat="$_in_tgc"
+    fi
+    if [[ -n "$tg_tok" && -z "$ARG_TG_INTERVAL" ]]; then
+      read -r -p "Interval update live status detik [${tg_int:-15}]: " _in_tgi || true
+      [[ -n "${_in_tgi:-}" ]] && tg_int="$_in_tgi"
+    fi
+  fi
+  if [[ -n "$tg_tok" || -n "$tg_chat" ]] && [[ -z "$tg_int" ]]; then
+    tg_int="15"
+  fi
+  if [[ -n "$tg_int" ]]; then
+    if ! python3 -c "import math,sys; v=float(sys.argv[1]); raise SystemExit(0 if math.isfinite(v) and 3.0 <= v <= 3600.0 else 1)" "$tg_int" 2>/dev/null; then
+      echo "Error: --tg-interval harus angka 3..3600 detik (dapat: $tg_int)" >&2
+      exit 1
+    fi
+  fi
+
+  write_token_env "$srv_url" "$srv_tok" "$tg_tok" "$tg_chat" "$tg_int"
   ARG_URL="$(_read_env_val UFASPROXY_URL)"
   ARG_TOKEN="$(_read_env_val UFASPROXY_TOKEN)"
+  tg_tok="$(_read_env_val UFASPROXY_TG_TOKEN)"
+  tg_chat="$(_read_env_val UFASPROXY_TG_CHAT_ID)"
+  tg_int="$(_read_env_val UFASPROXY_TG_INTERVAL)"
 
   sync_defaults_to_github "$ARG_URL" "$ARG_TOKEN"
+  sync_systemd_env
+
+  local tg_note="nonaktif (isi --tg-token & --tg-chat-id untuk aktifkan)"
+  if [[ -n "$tg_tok" && -n "$tg_chat" ]]; then
+    tg_note="AKTIF (chat_id=$tg_chat, interval=${tg_int:-15}s)"
+  elif [[ -n "$tg_tok" || -n "$tg_chat" ]]; then
+    tg_note="BELUM LENGKAP (butuh --tg-token dan --tg-chat-id)"
+  fi
 
   cat <<EOF
 
 [OK] ufasproxy SERVER prerequisites verified!
-Saved gateway URL/token -> $TOKEN_FILE (chmod 600)
+Saved gateway URL/token/Telegram -> $TOKEN_FILE (chmod 600)
+Telegram live status: $tg_note
 Start the gateway with:
-  sudo env UFASPROXY_TOKEN="$ARG_TOKEN" python3 "$SCRIPT_DIR/server.py" --ovpn-dir /path/to/vpns-surfshark --udp-only --port 8080 --public-ip "$pub_ip"
+  sudo python3 "$SCRIPT_DIR/server.py" --ovpn-dir /path/to/vpns-surfshark --udp-only --port 8080 --public-ip "$pub_ip"
 Sync other clients to this server with:
   bash install.sh --client --url "$ARG_URL" --token "$ARG_TOKEN"
-Optional: --roll-token (new random token), --no-git-push, multiple --ovpn-dir paths, --base-proxy-port 20001, --max-slots 45, --ttl-s 180
+Optional: --roll-token, --no-git-push, --tg-token, --tg-chat-id, --tg-interval, --restart, --base-proxy-port 20001, --max-slots 45, --ttl-s 180
 EOF
 }
 

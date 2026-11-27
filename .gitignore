@@ -11,6 +11,7 @@ pass.txt
 .env
 token.env
 .ufasproxy_state.json*
+.tg_status_state.json*
 *.log
 output/
 input/proxies.txt

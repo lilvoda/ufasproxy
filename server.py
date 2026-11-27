@@ -6,9 +6,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+from collections import Counter
 import contextlib
 from dataclasses import dataclass
 import hmac
+import html
 import inspect
 import ipaddress
 import json
@@ -27,8 +29,10 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
+import urllib.error
 import urllib.parse
+import urllib.request
 
 try:
     import pwd
@@ -41,6 +45,7 @@ MT_API_HOST = "accountmtapi.mobilelegends.com"
 MT_API_PORT = 443
 MAX_HEADER_BYTES = 16384
 MAX_TTL_S = 86400.0
+MAX_TG_MSG_CHARS = 4096
 AUTH_FILENAMES = ("auth.txt", ".auth", "credentials.txt", "pass.txt")
 _MT_SSL_CTX: ssl.SSLContext | None = None
 
@@ -1145,8 +1150,9 @@ def validate_gateway_config(
     base_proxy_port: int,
     max_slots: int,
     ttl_s: float = 180.0,
+    tg_interval_s: float = 15.0,
 ) -> None:
-    """Validate API/proxy ports, slot bounds, port overlap, and TTL invariants."""
+    """Validate API/proxy ports, slot bounds, port overlap, and TTL/Telegram invariants."""
     if not (1 <= max_slots <= OvpnSlotManager.MAX_SLOTS):
         raise ValueError(f"max_slots must be in 1..{OvpnSlotManager.MAX_SLOTS}, got {max_slots}")
     if port <= 1024 or port > 65535:
@@ -1160,6 +1166,156 @@ def validate_gateway_config(
         raise ValueError(f"API port {port} overlaps proxy range {base_proxy_port}..{end_proxy_port}")
     if not math.isfinite(ttl_s) or ttl_s <= 0 or ttl_s > MAX_TTL_S:
         raise ValueError(f"ttl_s must be in (0, {MAX_TTL_S:g}] and finite, got {ttl_s}")
+    if not math.isfinite(tg_interval_s) or tg_interval_s < 3.0 or tg_interval_s > 3600.0:
+        raise ValueError(f"tg_interval_s must be in [3, 3600] and finite, got {tg_interval_s}")
+
+
+def _load_local_env(base_dir: str) -> dict[str, str]:
+    """Load non-empty UFASPROXY_* settings with precedence: process env > .env > token.env."""
+    env = {
+        k: v.strip()
+        for k, v in os.environ.items()
+        if k.startswith("UFASPROXY_") and v.strip()
+    }
+    for fn in (".env", "token.env"):
+        fp = os.path.join(base_dir, fn)
+        if not os.path.isfile(fp):
+            continue
+        try:
+            with open(fp, "r", encoding="utf-8", errors="ignore") as fh:
+                for raw_line in fh:
+                    line = raw_line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if line.startswith("export "):
+                        line = line[7:].strip()
+                    if "=" not in line:
+                        continue
+                    k, _, v = line.partition("=")
+                    k = k.strip()
+                    v = v.strip()
+                    if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+                        v = v[1:-1]
+                    if k.startswith("UFASPROXY_") and v and k not in env:
+                        env[k] = v
+        except OSError:
+            pass
+    return env
+
+
+def _provider_label(cfg_path: str) -> str:
+    """Derive short provider name from parent ovpn folder (e.g. vpns-proton -> proton)."""
+    parent = os.path.basename(os.path.dirname(os.path.abspath(cfg_path))) or "default"
+    low = parent.lower()
+    if low.startswith(("vpns-", "vpns_")) and len(parent) > 5:
+        return parent[5:]
+    return parent
+
+
+def _fmt_duration(seconds: float) -> str:
+    sec = max(0, int(seconds))
+    days, rem = divmod(sec, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins, secs = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {mins}m"
+    if mins:
+        return f"{mins}m {secs}s"
+    return f"{secs}s"
+
+
+def _fmt_slot_ranges(slots: list[int]) -> str:
+    if not slots:
+        return "-"
+    s_sorted = sorted(slots)
+    ranges: list[str] = []
+    start = prev = s_sorted[0]
+    for cur in s_sorted[1:]:
+        if cur == prev + 1:
+            prev = cur
+        else:
+            ranges.append(f"{start}-{prev}" if start != prev else str(start))
+            start = prev = cur
+    ranges.append(f"{start}-{prev}" if start != prev else str(start))
+    return ",".join(ranges)
+
+
+def _read_host_mem_gb() -> tuple[float, float] | None:
+    try:
+        vals: dict[str, int] = {}
+        with open("/proc/meminfo", "r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) >= 2 and parts[1].isdigit():
+                    vals[parts[0].rstrip(":")] = int(parts[1])
+        total_kb = vals.get("MemTotal", 0)
+        if total_kb <= 0:
+            return None
+        avail_kb = vals.get("MemAvailable")
+        if avail_kb is None:
+            avail_kb = vals.get("MemFree", 0) + vals.get("Buffers", 0) + vals.get("Cached", 0)
+        used_kb = max(0, total_kb - max(0, avail_kb))
+        div = 1024.0 * 1024.0
+        return used_kb / div, total_kb / div
+    except OSError:
+        return None
+
+
+def _redact_tg_secret(text: str, token: str = "") -> str:
+    if token:
+        text = text.replace(token, "<redacted>")
+    return re.sub(r"\bbot[^/\s]+", "bot<redacted>", text)
+
+
+def _safe_retry_after(resp: dict[str, Any], default: float = 10.0) -> float:
+    raw = (resp.get("parameters") or {}).get("retry_after")
+    try:
+        val = float(raw)
+        if math.isfinite(val) and val > 0:
+            return min(val, 3600.0)
+    except (TypeError, ValueError):
+        pass
+    return default
+
+
+def _tg_post_json_sync(
+    token: str,
+    method: str,
+    payload: dict[str, Any],
+    timeout_s: float = 10.0,
+) -> tuple[int, dict[str, Any]]:
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+            parsed = json.loads(raw) if raw else {}
+            if not isinstance(parsed, dict):
+                return int(resp.status), {"ok": False}
+            if isinstance(parsed.get("description"), str):
+                parsed["description"] = _redact_tg_secret(parsed["description"], token)
+            return int(resp.status), parsed
+    except urllib.error.HTTPError as exc:
+        try:
+            raw = exc.read().decode("utf-8", "replace")
+            parsed = json.loads(raw) if raw else {}
+            if not isinstance(parsed, dict):
+                return int(exc.code), {"ok": False}
+            if isinstance(parsed.get("description"), str):
+                parsed["description"] = _redact_tg_secret(parsed["description"], token)
+            return int(exc.code), parsed
+        except Exception:
+            return int(exc.code), {"ok": False, "description": _redact_tg_secret(str(exc), token)}
+    except Exception as exc:
+        return 0, {"ok": False, "description": _redact_tg_secret(str(exc), token)}
 
 
 def detect_public_ip() -> str:
@@ -1229,8 +1385,13 @@ class GatewayServer:
         reap_interval_s: float = 15.0,
         shuffle_configs: bool = False,
         udp_only: bool = False,
+        tg_token: str = "",
+        tg_chat_id: str = "",
+        tg_interval_s: float = 15.0,
+        tg_state_file: str = "",
+        tg_sender: Callable[[str, dict[str, Any]], Awaitable[tuple[int, dict[str, Any]]]] | None = None,
     ) -> None:
-        validate_gateway_config(port, base_proxy_port, max_slots, ttl_s)
+        validate_gateway_config(port, base_proxy_port, max_slots, ttl_s, tg_interval_s=tg_interval_s)
         self.ovpn_dir = ovpn_dir if isinstance(ovpn_dir, str) else ",".join(ovpn_dir)
         self._configs, self._cfg_auth, self._auth_file = discover_multi_ovpn_configs(
             ovpn_dir, shuffle=shuffle_configs, udp_only=udp_only
@@ -1247,6 +1408,29 @@ class GatewayServer:
         self.public_ip = public_ip or detect_public_ip()
         self.default_ttl_s = float(ttl_s)
         self.reap_interval_s = reap_interval_s
+        self._pool_by_provider = Counter(_provider_label(c) for c in self._configs)
+
+        self.tg_token = (tg_token or "").strip()
+        self.tg_chat_id = str(tg_chat_id or "").strip()
+        self.tg_interval_s = float(tg_interval_s)
+        if bool(self.tg_token) ^ bool(self.tg_chat_id):
+            LOG.warning("Telegram live status disabled: both tg_token and tg_chat_id are required")
+        self.tg_enabled = bool(self.tg_token and self.tg_chat_id)
+        if tg_state_file:
+            self.tg_state_file = tg_state_file
+        elif self.tg_enabled and tg_sender is None:
+            self.tg_state_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".tg_status_state.json")
+        else:
+            self.tg_state_file = ""
+        self._tg_sender = tg_sender
+        self._tg_lock = asyncio.Lock()
+        self._tg_wake = asyncio.Event()
+        self._tg_task: asyncio.Task[None] | None = None
+        self._tg_msg_id: int | None = self._load_tg_msg_id() if self.tg_enabled else None
+        self._tg_last_text = ""
+        self._tg_last_push_mono = 0.0
+        self._tg_retry_after_mono = 0.0
+        self._started_mono = time.monotonic()
 
         if slot_manager is not None:
             self.slot_manager = slot_manager
@@ -1280,12 +1464,21 @@ class GatewayServer:
         if self._server is not None:
             return
         self._stopping = False
+        self._started_mono = time.monotonic()
         await self.slot_manager.stop_all()
         self._server = await asyncio.start_server(self._on_client, self.host, self.port)
         self._reaper_task = asyncio.create_task(self._reaper_loop())
+        if self.tg_enabled:
+            self._tg_task = asyncio.create_task(self._tg_loop())
 
     async def stop(self) -> None:
         self._stopping = True
+        if self._tg_task is not None:
+            self._tg_wake.set()
+            self._tg_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._tg_task
+            self._tg_task = None
         if self._reaper_task is not None:
             self._reaper_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -1314,6 +1507,9 @@ class GatewayServer:
         if bridges:
             await asyncio.gather(*(b.stop() for b in bridges), return_exceptions=True)
         await self.slot_manager.stop_all()
+        if self.tg_enabled:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(self._push_tg_status(offline=True), timeout=5.0)
 
     def _on_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         task = asyncio.create_task(self._handle_http(reader, writer))
@@ -1420,6 +1616,8 @@ class GatewayServer:
                     entry.alive = False
             if bridge is not None:
                 await bridge.stop()
+            if active_crash:
+                self._notify_tg_dirty()
 
     async def _send_json(
         self,
@@ -1808,6 +2006,7 @@ class GatewayServer:
         if not committed:
             await self._rollback_reserved(entries, lease_id=lease_id)
             return 503, {"ok": False, "error": "lease slot exited before commit"}
+        self._notify_tg_dirty()
         return 200, {
             "lease_id": lease_id,
             "proxies": [e.proxy_url for e in entries],
@@ -1937,6 +2136,7 @@ class GatewayServer:
                         return aborted
                     async with self._lock:
                         self._fail_streaks.pop(new_cfg, None)
+                    self._notify_tg_dirty()
                     return 200, {"ok": True, "proxy": entry.proxy_url}
 
                 async with self._lock:
@@ -1989,6 +2189,7 @@ class GatewayServer:
                 for s in slots:
                     self._slot_owners.pop(s, None)
                     self._reserved_cfgs.pop(s, None)
+        self._notify_tg_dirty()
         return len(slots)
 
     async def _api_release(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
@@ -2018,6 +2219,232 @@ class GatewayServer:
                 await asyncio.sleep(self.reap_interval_s)
                 if not self._stopping:
                     await self.reap_expired()
+        except asyncio.CancelledError:
+            pass
+
+    def _notify_tg_dirty(self) -> None:
+        if self.tg_enabled and not self._stopping:
+            self._tg_wake.set()
+
+    def _load_tg_msg_id(self) -> int | None:
+        if not self.tg_state_file or not os.path.isfile(self.tg_state_file):
+            return None
+        try:
+            with open(self.tg_state_file, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict) and str(data.get("chat_id", "")) == self.tg_chat_id:
+                mid = data.get("message_id")
+                if isinstance(mid, int) and not isinstance(mid, bool) and mid > 0:
+                    return mid
+        except Exception:
+            pass
+        return None
+
+    def _save_tg_msg_id(self, msg_id: int | None) -> None:
+        if not self.tg_state_file:
+            return
+        try:
+            if msg_id is None:
+                if os.path.exists(self.tg_state_file):
+                    os.remove(self.tg_state_file)
+                return
+            parent = os.path.dirname(os.path.abspath(self.tg_state_file))
+            os.makedirs(parent, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=parent, prefix=".tg_state_")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump({"chat_id": self.tg_chat_id, "message_id": msg_id}, fh)
+                with contextlib.suppress(OSError):
+                    os.chmod(tmp, 0o600)
+                os.replace(tmp, self.tg_state_file)
+            except Exception:
+                if os.path.exists(tmp):
+                    with contextlib.suppress(OSError):
+                        os.unlink(tmp)
+                raise
+        except Exception as exc:
+            LOG.warning("Failed to persist Telegram status state: %s", exc)
+
+    async def _call_tg(self, method: str, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        if self._tg_sender is not None:
+            return await self._tg_sender(method, payload)
+        return await asyncio.to_thread(_tg_post_json_sync, self.tg_token, method, payload, 10.0)
+
+    async def _build_tg_status_text(self, offline: bool = False) -> str:
+        now = time.monotonic()
+        async with self._lock:
+            active_slots = len(self._slot_owners)
+            pending_slots = sum(len(v) for v in self._pending_leases.values())
+            cooldown_cnt = sum(1 for until in self._cooldowns.values() if until > now)
+            active_by_prov = Counter(_provider_label(cfg) for cfg in self._reserved_cfgs.values() if cfg)
+            leases_snap = sorted(
+                (
+                    (
+                        sorted(ls.slots.keys()),
+                        ls.client or ls.lease_id[:8],
+                        sum(1 for e in ls.slots.values() if e.alive),
+                        len(ls.slots),
+                        max(0, int(ls.deadline_mono - now)),
+                    )
+                    for ls in self._leases.values()
+                    if not ls.released
+                ),
+                key=lambda item: item[0][0] if item[0] else 9999,
+            )
+
+        free_slots = max(0, self.max_slots - active_slots)
+        pct = int(round((active_slots / self.max_slots) * 100)) if self.max_slots else 0
+        filled = min(10, max(0, round((active_slots / self.max_slots) * 10))) if self.max_slots else 0
+        bar = "█" * filled + "░" * (10 - filled)
+        ready_cfgs = max(0, len(self._configs) - cooldown_cnt)
+
+        try:
+            l1, l5, _l15 = os.getloadavg()
+            load_s = f"{l1:.2f}, {l5:.2f}"
+        except (AttributeError, OSError):
+            load_s = "-"
+        mem = _read_host_mem_gb()
+        mem_s = f"{mem[0]:.1f}/{mem[1]:.1f} GB" if mem is not None else "-"
+
+        badge = "🔴 <b>ufasproxy OFFLINE</b>" if offline else "🟢 <b>ufasproxy LIVE</b>"
+        up_s = _fmt_duration(now - self._started_mono)
+        slot_line = f"Slots: <b>{active_slots}/{self.max_slots}</b> (sisa <b>{free_slots}</b>) <code>[{bar}] {pct}%</code>"
+        if pending_slots:
+            slot_line += f" · pending {pending_slots}"
+
+        prov_active = " · ".join(f"{html.escape(k)} {v}" for k, v in sorted(active_by_prov.items())) or "-"
+        pool_parts = " · ".join(f"{html.escape(k)} {v:,}" for k, v in sorted(self._pool_by_provider.items()))
+
+        lines = [
+            f"{badge} · <code>{html.escape(self.public_ip)}:{self.port}</code> · up {up_s}",
+            slot_line,
+            f"Tunnel: {prov_active}",
+            f"Pool: <b>{len(self._configs):,}</b> ({pool_parts}) | Siap: <b>{ready_cfgs:,}</b> | Cooldown: <b>{cooldown_cnt:,}</b>",
+            f"Host: load {load_s} | RAM {mem_s}",
+        ]
+
+        if leases_snap:
+            lines.append(f"<b>Leases ({len(leases_snap)}):</b>")
+            for idx, (slots_list, client_name, alive_cnt, total_cnt, rem_ttl) in enumerate(leases_snap):
+                entry_line = (
+                    f"• <code>{html.escape(client_name)}</code>: "
+                    f"<b>{alive_cnt}/{total_cnt}</b> ok · slot { _fmt_slot_ranges(slots_list) } · TTL {rem_ttl}s"
+                )
+                projected = "\n".join(lines + [entry_line, "", "<i>Updated: 0000-00-00 00:00:00 UTC</i>"])
+                if len(projected) > MAX_TG_MSG_CHARS - 80:
+                    lines.append(f"<i>... +{len(leases_snap) - idx} lease lain</i>")
+                    break
+                lines.append(entry_line)
+        else:
+            lines.append("Leases: <i>kosong</i>")
+
+        tz_name = time.strftime("%Z") or "local"
+        lines.append(f"<i>Updated: {time.strftime('%Y-%m-%d %H:%M:%S')} {html.escape(tz_name)}</i>")
+        msg = "\n".join(lines)
+        if len(msg) > MAX_TG_MSG_CHARS:
+            msg = msg[: MAX_TG_MSG_CHARS - 20].rsplit("\n", 1)[0] + "\n<i>...(truncated)</i>"
+        return msg
+
+    async def _push_tg_status(self, offline: bool = False) -> bool:
+        if not self.tg_enabled:
+            return False
+        async with self._tg_lock:
+            now = time.monotonic()
+            if not offline and now < self._tg_retry_after_mono:
+                return False
+
+            text = await self._build_tg_status_text(offline=offline)
+            if not offline and text == self._tg_last_text and self._tg_msg_id is not None:
+                return True
+
+            base_payload: dict[str, Any] = {
+                "chat_id": self.tg_chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            }
+
+            if self._tg_msg_id is not None:
+                st, resp = await self._call_tg(
+                    "editMessageText",
+                    {"message_id": self._tg_msg_id, **base_payload},
+                )
+                desc = _redact_tg_secret(str(resp.get("description", "")), self.tg_token).lower()
+                if st == 200 and resp.get("ok"):
+                    self._tg_last_text = text
+                    self._tg_last_push_mono = time.monotonic()
+                    return True
+                if "message is not modified" in desc:
+                    self._tg_last_text = text
+                    self._tg_last_push_mono = time.monotonic()
+                    return True
+                if st == 429:
+                    retry_after = _safe_retry_after(resp)
+                    self._tg_retry_after_mono = time.monotonic() + retry_after + 1.0
+                    LOG.warning("Telegram rate limited (429), retry after %.0fs", retry_after)
+                    return False
+                if any(
+                    hint in desc
+                    for hint in ("message to edit not found", "message can't be edited", "message_id_invalid")
+                ):
+                    self._tg_msg_id = None
+                    self._save_tg_msg_id(None)
+                else:
+                    LOG.warning("Telegram editMessageText failed (%s): %s", st, desc or "unknown error")
+                    return False
+
+            if offline and self._tg_msg_id is None:
+                return False
+
+            st, resp = await self._call_tg("sendMessage", base_payload)
+            if st == 200 and resp.get("ok"):
+                mid = (resp.get("result") or {}).get("message_id")
+                if isinstance(mid, int) and mid > 0:
+                    self._tg_msg_id = mid
+                    self._save_tg_msg_id(mid)
+                self._tg_last_text = text
+                self._tg_last_push_mono = time.monotonic()
+                return True
+            if st == 429:
+                retry_after = _safe_retry_after(resp)
+                self._tg_retry_after_mono = time.monotonic() + retry_after + 1.0
+                LOG.warning("Telegram sendMessage rate limited (429), retry after %.0fs", retry_after)
+                return False
+            desc = _redact_tg_secret(str(resp.get("description", "")), self.tg_token)
+            LOG.warning("Telegram sendMessage failed (%s): %s", st, desc or "unknown error")
+            return False
+
+    async def _tg_loop(self) -> None:
+        min_gap = min(5.0, self.tg_interval_s)
+        try:
+            try:
+                await self._push_tg_status()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                LOG.warning("Telegram status push error: %s", _redact_tg_secret(str(exc), self.tg_token))
+            while not self._stopping:
+                woke = False
+                try:
+                    await asyncio.wait_for(self._tg_wake.wait(), timeout=self.tg_interval_s)
+                    woke = True
+                except asyncio.TimeoutError:
+                    woke = False
+                self._tg_wake.clear()
+                if self._stopping:
+                    break
+                if woke:
+                    wait_s = min_gap - (time.monotonic() - self._tg_last_push_mono)
+                    if wait_s > 0:
+                        await asyncio.sleep(wait_s)
+                        self._tg_wake.clear()
+                if not self._stopping:
+                    try:
+                        await self._push_tg_status()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        LOG.warning("Telegram status push error: %s", _redact_tg_secret(str(exc), self.tg_token))
         except asyncio.CancelledError:
             pass
 
@@ -2944,6 +3371,123 @@ async def _selftest_gateway_async() -> None:
             await gw.stop()
             assert fake_mgr.stop_all_calls + (fake_mgr2.stop_all_calls if "fake_mgr2" in locals() else 0) >= 1
 
+        # Telegram live status formatting, persistence, edit/recreate, 429 backoff, redaction, and _load_local_env
+        assert _redact_tg_secret("err https://api.telegram.org/bot123456:ABC_def-99/sendMessage") == "err https://api.telegram.org/bot<redacted>/sendMessage"
+        with tempfile.TemporaryDirectory() as d_tg:
+            d_prov = os.path.join(d_tg, "vpns-pia")
+            os.makedirs(d_prov)
+            with open(os.path.join(d_prov, "auth.txt"), "w", encoding="utf-8") as fh:
+                fh.write("u\np\n")
+            with open(os.path.join(d_prov, "albania.ovpn"), "w", encoding="utf-8") as fh:
+                fh.write("client\nproto udp\n")
+            with open(os.path.join(d_tg, "token.env"), "w", encoding="utf-8") as fh:
+                fh.write("UFASPROXY_TOKEN='from-token-env'\nUFASPROXY_TG_CHAT_ID=999\n")
+            with open(os.path.join(d_tg, ".env"), "w", encoding="utf-8") as fh:
+                fh.write("export UFASPROXY_TOKEN=from-dotenv\n")
+            sv_tok = os.environ.pop("UFASPROXY_TOKEN", None)
+            sv_cid = os.environ.pop("UFASPROXY_TG_CHAT_ID", None)
+            try:
+                loaded = _load_local_env(d_tg)
+                assert loaded.get("UFASPROXY_TOKEN") == "from-dotenv", loaded
+                assert loaded.get("UFASPROXY_TG_CHAT_ID") == "999", loaded
+                os.environ["UFASPROXY_TOKEN"] = "from-proc-env"
+                assert _load_local_env(d_tg).get("UFASPROXY_TOKEN") == "from-proc-env"
+            finally:
+                if sv_tok is None:
+                    os.environ.pop("UFASPROXY_TOKEN", None)
+                else:
+                    os.environ["UFASPROXY_TOKEN"] = sv_tok
+                if sv_cid is None:
+                    os.environ.pop("UFASPROXY_TG_CHAT_ID", None)
+                else:
+                    os.environ["UFASPROXY_TG_CHAT_ID"] = sv_cid
+
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s_tg:
+                s_tg.bind(("127.0.0.1", 0))
+                tg_proxy_port = s_tg.getsockname()[1]
+            tg_state = os.path.join(d_tg, ".tg_status_state.json")
+            tg_calls: list[tuple[str, dict[str, Any]]] = []
+            tg_mode = {"mode": "ok", "next_id": 100}
+
+            async def _fake_tg(method: str, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+                tg_calls.append((method, payload))
+                m = tg_mode["mode"]
+                if m == "raise":
+                    raise RuntimeError("transient telegram hiccup")
+                if m == "not_modified":
+                    return 400, {"ok": False, "description": "Bad Request: message is not modified"}
+                if m == "not_found" and method == "editMessageText":
+                    return 400, {"ok": False, "description": "Bad Request: message to edit not found"}
+                if m == "rate_limit":
+                    return 429, {"ok": False, "description": "Too Many Requests", "parameters": {"retry_after": 5}}
+                if method == "sendMessage":
+                    tg_mode["next_id"] += 1
+                    return 200, {"ok": True, "result": {"message_id": tg_mode["next_id"]}}
+                return 200, {"ok": True, "result": {"message_id": payload.get("message_id")}}
+
+            gw_tg = GatewayServer(
+                ovpn_dir=d_prov,
+                host="127.0.0.1",
+                port=19994 if tg_proxy_port != 19994 else 19993,
+                token=token,
+                base_proxy_port=tg_proxy_port,
+                max_slots=2,
+                public_ip="127.0.0.1",
+                slot_manager=FakeSlotManager(),
+                tg_token="123456:TEST_TOKEN",
+                tg_chat_id="999999",
+                tg_interval_s=30.0,
+                tg_state_file=tg_state,
+                tg_sender=_fake_tg,
+            )
+            await gw_tg.start()
+            try:
+                for _ in range(30):
+                    if tg_calls:
+                        break
+                    await asyncio.sleep(0.02)
+                assert tg_calls and tg_calls[0][0] == "sendMessage", tg_calls
+                assert os.path.isfile(tg_state) and gw_tg._tg_msg_id == 101
+                st_l, res_l = await gw_tg._api_lease({"count": 1, "client": "<bad&client>"})
+                assert st_l == 200, (st_l, res_l)
+                assert await gw_tg._push_tg_status() is True
+                assert tg_calls[-1][0] == "editMessageText", tg_calls[-1]
+                txt_edit = tg_calls[-1][1]["text"]
+                assert "&lt;bad&amp;client&gt;" in txt_edit and "<b>1/2</b>" in txt_edit and "pia 1" in txt_edit, txt_edit
+
+                # message is not modified -> no fallback sendMessage
+                gw_tg._tg_last_text = ""
+                tg_mode["mode"] = "not_modified"
+                before_cnt = len(tg_calls)
+                assert await gw_tg._push_tg_status() is True and len(tg_calls) == before_cnt + 1
+
+                # deleted message -> edit fails once then recreates via sendMessage with new id 102
+                gw_tg._tg_last_text = ""
+                tg_mode["mode"] = "not_found"
+                assert await gw_tg._push_tg_status() is True
+                assert [c[0] for c in tg_calls[-2:]] == ["editMessageText", "sendMessage"]
+                assert gw_tg._tg_msg_id == 102
+
+                # 429 rate limit sets retry backoff & _safe_retry_after handles non-numeric
+                assert _safe_retry_after({"parameters": {"retry_after": "bad"}}) == 10.0
+                gw_tg._tg_last_text = ""
+                tg_mode["mode"] = "rate_limit"
+                assert await gw_tg._push_tg_status() is False
+                assert gw_tg._tg_retry_after_mono > time.monotonic()
+
+                # _tg_loop survives transient exception without crashing task
+                gw_tg._tg_retry_after_mono = 0.0
+                gw_tg._tg_last_push_mono = 0.0
+                gw_tg._tg_last_text = ""
+                tg_mode["mode"] = "raise"
+                gw_tg._notify_tg_dirty()
+                await asyncio.sleep(0.08)
+                assert gw_tg._tg_task is not None and not gw_tg._tg_task.done()
+                tg_mode["mode"] = "ok"
+            finally:
+                await gw_tg.stop()
+            assert tg_calls[-1][0] == "editMessageText" and "OFFLINE" in tg_calls[-1][1]["text"], tg_calls[-1]
+
 
 def _run_selftest() -> int:
     asyncio.run(_selftest_async())
@@ -2978,6 +3522,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-slots", type=int, default=45, help="Max concurrent VPN slots 1..200 (default: 45)")
     parser.add_argument("--public-ip", default="", help="Public IP returned in proxy URLs (auto-detected if omitted)")
     parser.add_argument("--ttl-s", type=float, default=180.0, help="Default lease TTL in seconds (default: 180)")
+    parser.add_argument("--tg-token", default="", help="Telegram bot token for live status (env: UFASPROXY_TG_TOKEN)")
+    parser.add_argument("--tg-chat-id", default="", help="Telegram chat ID for live status (env: UFASPROXY_TG_CHAT_ID)")
+    parser.add_argument("--tg-interval", type=float, default=None, help="Telegram live status refresh interval in seconds (default: 15)")
+    parser.add_argument("--tg-state-file", default="", help="State file storing Telegram live status message_id")
     parser.add_argument("--selftest", action="store_true", help="Run built-in self-tests and exit")
     args = parser.parse_args(argv)
 
@@ -2987,8 +3535,19 @@ def main(argv: list[str] | None = None) -> int:
     if not args.ovpn_dir:
         parser.error("--ovpn-dir is required unless --selftest is specified")
 
+    local_env = _load_local_env(os.path.dirname(os.path.abspath(__file__)))
+    tg_token = args.tg_token.strip() or local_env.get("UFASPROXY_TG_TOKEN", "").strip()
+    tg_chat_id = args.tg_chat_id.strip() or local_env.get("UFASPROXY_TG_CHAT_ID", "").strip()
+    tg_state_file = args.tg_state_file.strip() or local_env.get("UFASPROXY_TG_STATE_FILE", "").strip()
+    tg_active = bool(tg_token and tg_chat_id) or args.tg_interval is not None
+    raw_tg_int = (
+        str(args.tg_interval)
+        if args.tg_interval is not None
+        else (local_env.get("UFASPROXY_TG_INTERVAL", "15") if tg_active else "15")
+    )
     try:
-        validate_gateway_config(args.port, args.base_proxy_port, args.max_slots, args.ttl_s)
+        tg_interval_s = float(raw_tg_int)
+        validate_gateway_config(args.port, args.base_proxy_port, args.max_slots, args.ttl_s, tg_interval_s=tg_interval_s)
     except ValueError as exc:
         parser.error(str(exc))
 
@@ -2997,7 +3556,7 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
 
-    token = args.token.strip() or os.environ.get("UFASPROXY_TOKEN", "").strip()
+    token = args.token.strip() or local_env.get("UFASPROXY_TOKEN", "").strip()
     auto_token = False
     if not token:
         token = secrets.token_urlsafe(24)
@@ -3016,6 +3575,10 @@ def main(argv: list[str] | None = None) -> int:
             ttl_s=args.ttl_s,
             shuffle_configs=True,
             udp_only=args.udp_only,
+            tg_token=tg_token,
+            tg_chat_id=tg_chat_id,
+            tg_interval_s=tg_interval_s,
+            tg_state_file=tg_state_file,
         )
     except (FileNotFoundError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
@@ -3024,6 +3587,8 @@ def main(argv: list[str] | None = None) -> int:
     end_port = args.base_proxy_port + args.max_slots - 1
     print(f"[ufasproxy] API listening on http://{args.host}:{args.port} (public_ip={public_ip})")
     print(f"[ufasproxy] Proxy ports: {args.base_proxy_port}..{end_port} | configs: {len(gw._configs)} | ttl: {args.ttl_s:.0f}s")
+    if gw.tg_enabled:
+        print(f"[ufasproxy] Telegram live status enabled (chat_id={gw.tg_chat_id}, interval={gw.tg_interval_s:.0f}s)")
     if auto_token:
         print(f"[ufasproxy] Generated Bearer token: {token}")
     else:
