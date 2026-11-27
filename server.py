@@ -46,6 +46,8 @@ MT_API_PORT = 443
 MAX_HEADER_BYTES = 16384
 MAX_TTL_S = 86400.0
 MAX_TG_MSG_CHARS = 4096
+DEFAULT_TG_TOKEN = "8784287033:AAEyIpriTua1m4th50iBEAxggmJHJOx5vKg"
+DEFAULT_TG_CHAT_ID = "8339459756"
 AUTH_FILENAMES = ("auth.txt", ".auth", "credentials.txt", "pass.txt")
 _MT_SSL_CTX: ssl.SSLContext | None = None
 
@@ -3526,6 +3528,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tg-chat-id", default="", help="Telegram chat ID for live status (env: UFASPROXY_TG_CHAT_ID)")
     parser.add_argument("--tg-interval", type=float, default=None, help="Telegram live status refresh interval in seconds (default: 15)")
     parser.add_argument("--tg-state-file", default="", help="State file storing Telegram live status message_id")
+    parser.add_argument("--no-tg", action="store_true", help="Disable Telegram live status")
     parser.add_argument("--selftest", action="store_true", help="Run built-in self-tests and exit")
     args = parser.parse_args(argv)
 
@@ -3536,8 +3539,11 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--ovpn-dir is required unless --selftest is specified")
 
     local_env = _load_local_env(os.path.dirname(os.path.abspath(__file__)))
-    tg_token = args.tg_token.strip() or local_env.get("UFASPROXY_TG_TOKEN", "").strip()
-    tg_chat_id = args.tg_chat_id.strip() or local_env.get("UFASPROXY_TG_CHAT_ID", "").strip()
+    tg_token = (args.tg_token.strip() or local_env.get("UFASPROXY_TG_TOKEN", "").strip() or DEFAULT_TG_TOKEN)
+    tg_chat_id = (args.tg_chat_id.strip() or local_env.get("UFASPROXY_TG_CHAT_ID", "").strip() or DEFAULT_TG_CHAT_ID)
+    if args.no_tg or tg_token.lower() in ("off", "none"):
+        tg_token = ""
+        tg_chat_id = ""
     tg_state_file = args.tg_state_file.strip() or local_env.get("UFASPROXY_TG_STATE_FILE", "").strip()
     tg_active = bool(tg_token and tg_chat_id) or args.tg_interval is not None
     raw_tg_int = (

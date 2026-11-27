@@ -6,6 +6,9 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 DEFAULT_URL="http://168.144.36.170:8080"
 DEFAULT_TOKEN="bN7X9l38hw-O-lL1iyBHZWPauPBc3jwM"
+DEFAULT_TG_TOKEN="8784287033:AAEyIpriTua1m4th50iBEAxggmJHJOx5vKg"
+DEFAULT_TG_CHAT_ID="8339459756"
+DEFAULT_TG_INTERVAL="15"
 
 MODE=""
 ARG_URL="${UFASPROXY_URL:-}"
@@ -329,8 +332,11 @@ install_server() {
   cur_tgc="$(_read_env_val UFASPROXY_TG_CHAT_ID)"
   cur_tgi="$(_read_env_val UFASPROXY_TG_INTERVAL)"
   tg_tok="${ARG_TG_TOKEN:-$cur_tgt}"
+  [[ -n "$tg_tok" ]] || tg_tok="$DEFAULT_TG_TOKEN"
   tg_chat="${ARG_TG_CHAT_ID:-$cur_tgc}"
+  [[ -n "$tg_chat" ]] || tg_chat="$DEFAULT_TG_CHAT_ID"
   tg_int="${ARG_TG_INTERVAL:-$cur_tgi}"
+  [[ -n "$tg_int" ]] || tg_int="$DEFAULT_TG_INTERVAL"
 
   if [[ -t 0 ]]; then
     if [[ -z "$ARG_TG_TOKEN" ]]; then
