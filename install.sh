@@ -11,12 +11,14 @@ MODE=""
 ARG_URL="${UFASPROXY_URL:-}"
 ARG_TOKEN="${UFASPROXY_TOKEN:-}"
 ROLL_TOKEN=0
+NO_GIT_PUSH=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --client|-c)  MODE="client"; shift ;;
-    --server|-s)  MODE="server"; shift ;;
-    --all|-a)     MODE="all"; shift ;;
-    --roll-token) ROLL_TOKEN=1; shift ;;
+    --client|-c)   MODE="client"; shift ;;
+    --server|-s)   MODE="server"; shift ;;
+    --all|-a)      MODE="all"; shift ;;
+    --roll-token)  ROLL_TOKEN=1; shift ;;
+    --no-git-push) NO_GIT_PUSH=1; shift ;;
     --url)
       [[ $# -ge 2 ]] || { echo "Error: --url requires a value" >&2; exit 1; }
       ARG_URL="$2"; shift 2 ;;
@@ -24,7 +26,7 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || { echo "Error: --token requires a value" >&2; exit 1; }
       ARG_TOKEN="$2"; shift 2 ;;
     -h|--help)
-      echo "Usage: bash install.sh [--client | --server | --all] [--url URL] [--token TOKEN] [--roll-token]"
+      echo "Usage: bash install.sh [--client | --server | --all] [--url URL] [--token TOKEN] [--roll-token] [--no-git-push]"
       exit 0
       ;;
     *)
@@ -125,6 +127,67 @@ write_token_env() {
   chmod 600 "$TOKEN_FILE" 2>/dev/null || true
 }
 
+sync_defaults_to_github() {
+  local new_url="$1" new_tok="$2"
+  local target_sh="$SCRIPT_DIR/install.sh"
+  [[ -f "$target_sh" && -n "$new_url" && -n "$new_tok" ]] || return 0
+  if [[ "$new_url" == "$DEFAULT_URL" && "$new_tok" == "$DEFAULT_TOKEN" ]]; then
+    return 0
+  fi
+
+  NEW_URL="$new_url" NEW_TOK="$new_tok" TARGET_SH="$target_sh" python3 - << 'PY'
+import os, re
+p = os.environ["TARGET_SH"]
+u = re.sub(r'[\r\n"$`\\]', '', os.environ["NEW_URL"]).strip()
+t = re.sub(r'[\r\n"$`\\]', '', os.environ["NEW_TOK"]).strip()
+txt = open(p, "r", encoding="utf-8").read()
+txt2, n1 = re.subn(r'(?m)^DEFAULT_URL=".*"$', f'DEFAULT_URL="{u}"', txt, count=1)
+txt2, n2 = re.subn(r'(?m)^DEFAULT_TOKEN=".*"$', f'DEFAULT_TOKEN="{t}"', txt2, count=1)
+if n1 == 1 and n2 == 1 and txt2 != txt:
+    with open(p, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(txt2)
+PY
+  DEFAULT_URL="$new_url"
+  DEFAULT_TOKEN="$new_tok"
+  bash -n "$target_sh"
+
+  [[ "$NO_GIT_PUSH" -eq 0 ]] || return 0
+  if ! command -v git >/dev/null 2>&1 || ! git -C "$SCRIPT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "[*] Default URL/token diperbarui di $target_sh (bukan repo git, lewati push)"
+    return 0
+  fi
+
+  git -C "$SCRIPT_DIR" add -- install.sh
+  if git -C "$SCRIPT_DIR" diff --cached --quiet -- install.sh; then
+    return 0
+  fi
+
+  git -C "$SCRIPT_DIR" -c user.name="ufasproxy" -c user.email="ufasproxy@local" \
+    commit --only install.sh -m "chore(install): update default gateway URL and token" >/dev/null
+
+  local askpass_f="" gh_tok="${GH_TOKEN:-${GITHUB_TOKEN:-}}" orig_url="" push_ok=0
+  orig_url="$(git -C "$SCRIPT_DIR" remote get-url origin 2>/dev/null || true)"
+  if [[ -n "$gh_tok" && "$orig_url" == https://* ]]; then
+    askpass_f="$(mktemp)"
+    chmod 700 "$askpass_f"
+    printf '#!/usr/bin/env sh\ncase "$1" in *Username*) echo "x-access-token";; *) printf "%%s\\n" "$UFP_GH_TOK";; esac\n' > "$askpass_f"
+    if UFP_GH_TOK="$gh_tok" GIT_ASKPASS="$askpass_f" GIT_TERMINAL_PROMPT=0 git -C "$SCRIPT_DIR" push origin HEAD; then
+      push_ok=1
+    fi
+    rm -f "$askpass_f"
+  else
+    if GIT_TERMINAL_PROMPT=0 git -C "$SCRIPT_DIR" push origin HEAD; then
+      push_ok=1
+    fi
+  fi
+
+  if [[ "$push_ok" -eq 1 ]]; then
+    echo "[*] Default URL & token di install.sh berhasil di-push ke GitHub ✓"
+  else
+    echo "[!] Auto-push install.sh ke GitHub gagal (butuh SSH key / git credential / GH_TOKEN) — token.env lokal tetap aktif, jalankan 'git push' manual." >&2
+  fi
+}
+
 install_server() {
   echo "[*] Installing ufasproxy SERVER gateway prerequisites..."
   if [[ "$SUDO" == "__NEED_ROOT__" ]]; then
@@ -168,6 +231,8 @@ install_server() {
   ARG_URL="$(_read_env_val UFASPROXY_URL)"
   ARG_TOKEN="$(_read_env_val UFASPROXY_TOKEN)"
 
+  sync_defaults_to_github "$ARG_URL" "$ARG_TOKEN"
+
   cat <<EOF
 
 [OK] ufasproxy SERVER prerequisites verified!
@@ -176,7 +241,7 @@ Start the gateway with:
   sudo env UFASPROXY_TOKEN="$ARG_TOKEN" python3 "$SCRIPT_DIR/server.py" --ovpn-dir /path/to/vpns-surfshark --udp-only --port 8080 --public-ip "$pub_ip"
 Sync other clients to this server with:
   bash install.sh --client --url "$ARG_URL" --token "$ARG_TOKEN"
-Optional: --roll-token (new random token), multiple --ovpn-dir paths, --base-proxy-port 20001, --max-slots 45, --ttl-s 180
+Optional: --roll-token (new random token), --no-git-push, multiple --ovpn-dir paths, --base-proxy-port 20001, --max-slots 45, --ttl-s 180
 EOF
 }
 
