@@ -81,21 +81,100 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   fi
 fi
 
-APT_UPDATED=0
-apt_install() {
-  if ! command -v apt-get >/dev/null 2>&1; then
-    echo "Error: apt-get not found (Ubuntu/Debian required)" >&2
+PKG_MGR=""
+for _pm in apt-get pacman dnf yum apk zypper; do
+  if command -v "$_pm" >/dev/null 2>&1; then
+    PKG_MGR="$_pm"
+    break
+  fi
+done
+
+PKG_UPDATED=0
+pkg_install() {
+  if [[ -z "$PKG_MGR" ]]; then
+    echo "Error: package manager tidak dikenali (butuh apt-get, pacman, dnf, yum, apk, atau zypper) untuk install: $*" >&2
     exit 1
   fi
   if [[ "$SUDO" == "__NEED_ROOT__" ]]; then
     echo "Error: root/sudo required to install system packages ($*)" >&2
     exit 1
   fi
-  if [[ "$APT_UPDATED" -eq 0 ]]; then
-    $SUDO env DEBIAN_FRONTEND=noninteractive apt-get update -y
-    APT_UPDATED=1
-  fi
-  $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@"
+  case "$PKG_MGR" in
+    apt-get)
+      if [[ "$PKG_UPDATED" -eq 0 ]]; then
+        $SUDO env DEBIAN_FRONTEND=noninteractive apt-get update -y
+        PKG_UPDATED=1
+      fi
+      $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@"
+      ;;
+    pacman)
+      if [[ "$PKG_UPDATED" -eq 0 ]]; then
+        $SUDO pacman -Sy --noconfirm
+        PKG_UPDATED=1
+      fi
+      $SUDO pacman -S --noconfirm --needed "$@"
+      ;;
+    dnf)
+      $SUDO dnf install -y "$@"
+      ;;
+    yum)
+      $SUDO yum install -y "$@"
+      ;;
+    apk)
+      $SUDO apk add --no-cache "$@"
+      ;;
+    zypper)
+      $SUDO zypper --non-interactive install -y "$@"
+      ;;
+  esac
+}
+
+pkg_install_group() {
+  local group="$1"
+  case "${PKG_MGR}:${group}" in
+    apt-get:python)   pkg_install python3 python3-venv python3-pip curl ca-certificates ;;
+    pacman:python)    pkg_install python python-pip curl ca-certificates ;;
+    dnf:python|yum:python) pkg_install python3 python3-pip curl ca-certificates ;;
+    apk:python)       pkg_install python3 py3-pip curl ca-certificates ;;
+    zypper:python)    pkg_install python3 python3-pip curl ca-certificates ;;
+
+    apt-get:server)   pkg_install python3 openvpn microsocks iproute2 iptables procps util-linux ca-certificates ;;
+    pacman:server)    pkg_install python openvpn microsocks iproute2 iptables procps-ng util-linux ca-certificates ;;
+    dnf:server|yum:server)
+      pkg_install python3 openvpn iproute iptables procps-ng util-linux ca-certificates
+      pkg_install microsocks || echo "[!] Paket microsocks tidak ada di repo default; install manual atau pakai EPEL/source." >&2
+      ;;
+    apk:server)       pkg_install python3 openvpn microsocks iproute2 iptables procps util-linux ca-certificates ;;
+    zypper:server)
+      pkg_install python3 openvpn iproute2 iptables procps util-linux ca-certificates
+      pkg_install microsocks || echo "[!] Paket microsocks tidak ada di repo default; install manual jika dibutuhkan server." >&2
+      ;;
+
+    pacman:chromium)
+      pkg_install nss nspr at-spi2-core libcups libdrm mesa libxkbcommon \
+        libxcomposite libxdamage libxfixes libxrandr libx11 libxext libxcb \
+        libxshmfence pango cairo alsa-lib dbus expat glib2 ttf-liberation
+      ;;
+    dnf:chromium|yum:chromium)
+      pkg_install nss nspr atk at-spi2-atk cups-libs libdrm mesa-libgbm libxkbcommon \
+        libXcomposite libXdamage libXfixes libXrandr libX11 libXext libxcb \
+        libxshmfence pango cairo alsa-lib dbus-libs expat glib2 liberation-sans-fonts
+      ;;
+    apk:chromium)
+      pkg_install chromium nss nspr at-spi2-core cups-libs libdrm mesa-gl mesa-gbm \
+        libxkbcommon libxcomposite libxdamage libxfixes libxrandr libx11 libxext \
+        libxcb libxshmfence pango cairo alsa-lib dbus-libs expat glib ttf-liberation
+      ;;
+    zypper:chromium)
+      pkg_install mozilla-nss mozilla-nspr libatk-1_0-0 libatk-bridge-2_0-0 libcups2 \
+        libdrm2 Mesa-libGL1 libgbm1 libxkbcommon0 libXcomposite1 libXdamage1 \
+        libXfixes3 libXrandr2 libX11-6 libXext6 libxcb1 libxshmfence1 \
+        libpango-1_0-0 libcairo2 libasound2 libdbus-1-3 libexpat1 libglib-2_0-0 liberation-fonts
+      ;;
+    *)
+      pkg_install
+      ;;
+  esac
 }
 
 CHK_NS="_ufp_chk_$$"
@@ -295,7 +374,7 @@ install_server() {
   fi
 
   echo "[1/4] Installing required server packages..."
-  apt_install python3 openvpn microsocks iproute2 iptables procps util-linux ca-certificates
+  pkg_install_group server
 
   echo "[2/4] Checking /dev/net/tun..."
   if [[ ! -c /dev/net/tun ]]; then
@@ -399,10 +478,13 @@ install_client() {
   echo "[*] Installing ufasproxy CLIENT checker prerequisites..."
 
   echo "[1/4] Checking Python 3.10+, venv, and pip..."
-  if ! command -v python3 >/dev/null 2>&1 || ! python3 -c "import ensurepip" >/dev/null 2>&1; then
-    apt_install python3 python3-venv python3-pip curl ca-certificates
+  local py_bin
+  py_bin="$(command -v python3 || command -v python || true)"
+  if [[ -z "$py_bin" ]] || ! "$py_bin" -c "import ensurepip" >/dev/null 2>&1; then
+    pkg_install_group python
+    py_bin="$(command -v python3 || command -v python || true)"
   fi
-  if ! python3 -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)" >/dev/null 2>&1; then
+  if [[ -z "$py_bin" ]] || ! "$py_bin" -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)" >/dev/null 2>&1; then
     echo "Error: Python 3.10+ required" >&2
     exit 1
   fi
@@ -410,7 +492,7 @@ install_client() {
   echo "[2/4] Setting up .venv and Python packages..."
   if [[ ! -x "$SCRIPT_DIR/.venv/bin/python" ]] || ! "$SCRIPT_DIR/.venv/bin/python" -m pip --version >/dev/null 2>&1; then
     rm -rf "$SCRIPT_DIR/.venv"
-    python3 -m venv "$SCRIPT_DIR/.venv"
+    "$py_bin" -m venv "$SCRIPT_DIR/.venv"
   fi
   local vpy="$SCRIPT_DIR/.venv/bin/python"
   "$vpy" -m pip install --upgrade pip setuptools wheel
@@ -418,17 +500,23 @@ install_client() {
 
   echo "[3/4] Installing Chromium OS dependencies & CloakBrowser binary..."
   if [[ "$(uname -s)" = "Linux" ]]; then
-    if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
-      env DEBIAN_FRONTEND=noninteractive "$vpy" -m playwright install-deps chromium
-    elif [[ -n "$SUDO" && "$SUDO" != "__NEED_ROOT__" ]]; then
-      $SUDO env "PATH=$PATH" DEBIAN_FRONTEND=noninteractive "$vpy" -m playwright install-deps chromium
+    if [[ "$PKG_MGR" = "apt-get" ]]; then
+      if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+        env DEBIAN_FRONTEND=noninteractive "$vpy" -m playwright install-deps chromium
+      elif [[ -n "$SUDO" && "$SUDO" != "__NEED_ROOT__" ]]; then
+        $SUDO env "PATH=$PATH" DEBIAN_FRONTEND=noninteractive "$vpy" -m playwright install-deps chromium
+      else
+        echo "Error: root/sudo required for playwright install-deps chromium" >&2
+        exit 1
+      fi
+    elif [[ -n "$PKG_MGR" ]]; then
+      pkg_install_group chromium
     else
-      echo "Error: root/sudo required for playwright install-deps chromium" >&2
-      exit 1
+      echo "[!] Package manager tidak dikenali; lewati instalasi library OS Chromium (install manual jika gagal launch)." >&2
     fi
   fi
   CLOAKBROWSER_CACHE_DIR="$SCRIPT_DIR/.cloak_old_cache" \
-    "$vpy" -c "from cloakbrowser.download import ensure_binary; ensure_binary(license_key=None)" || true
+    "$vpy" -c "from cloakbrowser.download import ensure_binary; p=ensure_binary(license_key=None); print('[*] CloakBrowser binary:', p)" || true
 
   echo "[4/4] Running old_browser_vpn.py --selftest..."
   "$vpy" "$SCRIPT_DIR/old_browser_vpn.py" --selftest
