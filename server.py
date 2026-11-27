@@ -74,6 +74,8 @@ def discover_ovpn_configs(ovpn_dir: str, shuffle: bool = False) -> tuple[list[st
                 continue
             low = entry.name.lower()
             if low.endswith(".ovpn"):
+                if "-tor.protonvpn" in low:
+                    continue
                 (udp_cfgs if low.endswith("udp.ovpn") else other_cfgs).append(entry.path)
             elif low in AUTH_FILENAMES:
                 named_auth[low] = entry.path
@@ -279,8 +281,8 @@ async def _upgrade_tls(
 async def probe_socks_mt_api(
     socks_host: str,
     socks_port: int,
-    timeout_s: float = 3.8,
-    max_rtt_ms: int = 3500,
+    timeout_s: float = 5.0,
+    max_rtt_ms: int = 4500,
 ) -> tuple[bool, int, str]:
     """Probe Moonton API over SOCKS5+TLS and enforce HTTP status + RTT budget."""
     t0 = time.monotonic()
@@ -295,7 +297,7 @@ async def probe_socks_mt_api(
             req = (
                 f"HEAD / HTTP/1.1\r\n"
                 f"Host: {MT_API_HOST}\r\n"
-                f"User-Agent: ufasproxy/1.0\r\n"
+                f"User-Agent: Mozilla/5.0\r\n"
                 f"Connection: close\r\n\r\n"
             ).encode("ascii")
             await _send_resp(writer, req)
@@ -357,7 +359,7 @@ class OvpnSlotManager:
     """Manage isolated ip netns OpenVPN slots with microsocks and kill-switch."""
 
     MAX_SLOTS = 200
-    HANDSHAKE_TIMEOUT_S = 9.0
+    HANDSHAKE_TIMEOUT_S = 10.5
     STOP_WAIT_S = 0.4
 
     def __init__(
@@ -1159,11 +1161,12 @@ class GatewayServer:
 
     COOLDOWN_S = 21600.0
     FAIL_COOLDOWN_S = 21600.0
+    MAX_FAIL_COOLDOWN_S = 86400.0
     MAX_BODY_BYTES = 65536
     REQUEST_TIMEOUT_S = 10.0
     LEASE_CONCURRENCY = 6
     MAX_LEASE_ATTEMPTS_PER_SLOT = 8
-    MAX_ROTATE_ATTEMPTS = 8
+    MAX_ROTATE_ATTEMPTS = 12
 
     def __init__(
         self,
@@ -1219,6 +1222,7 @@ class GatewayServer:
         self._slot_owners: dict[int, str] = {}
         self._reserved_cfgs: dict[int, str] = {}
         self._cooldowns: dict[str, float] = {}
+        self._fail_streaks: dict[str, int] = {}
         self._rr_idx = 0
         self._server: asyncio.AbstractServer | None = None
         self._reaper_task: asyncio.Task[None] | None = None
@@ -1281,6 +1285,15 @@ class GatewayServer:
             dur = self.COOLDOWN_S if duration_s is None else duration_s
             self._cooldowns[cfg] = max(self._cooldowns.get(cfg, 0.0), time.monotonic() + dur)
 
+    def _mark_failed(self, cfg: str) -> None:
+        """Apply escalating cooldown to repeat-failing configs so working configs sort ahead."""
+        if not cfg:
+            return
+        streak = self._fail_streaks.get(cfg, 0) + 1
+        self._fail_streaks[cfg] = streak
+        dur = min(self.MAX_FAIL_COOLDOWN_S, self.FAIL_COOLDOWN_S * min(4, streak))
+        self._mark_cooldown(cfg, dur)
+
     def _pick_next_config(self, exclude: set[str], allow_cooldown_fallback: bool) -> str | None:
         """Select unused .ovpn round-robin from _rr_idx (off-cooldown first). Caller holds self._lock."""
         now = time.monotonic()
@@ -1325,7 +1338,10 @@ class GatewayServer:
                     elif lease_id in self._pending_leases:
                         entry = next((e for e in self._pending_leases[lease_id] if e.slot == slot), None)
                 active_crash = bool(entry is not None and cfg and entry.cfg == cfg)
-                self._mark_cooldown(cfg, self.FAIL_COOLDOWN_S if active_crash else self.COOLDOWN_S)
+                if active_crash:
+                    self._mark_failed(cfg)
+                else:
+                    self._mark_cooldown(cfg, self.COOLDOWN_S)
                 if active_crash and entry is not None:
                     bridge = entry.bridge
                     entry.bridge = None
@@ -1667,6 +1683,7 @@ class GatewayServer:
                                     entry.cfg = cfg
                                     entry.bridge = bridge
                                     entry.alive = True
+                                    self._fail_streaks.pop(cfg, None)
                                     abort_now = False
                             if abort_now:
                                 await bridge.stop()
@@ -1681,7 +1698,7 @@ class GatewayServer:
                         async with self._lock:
                             if self._reserved_cfgs.get(entry.slot) == cfg:
                                 self._reserved_cfgs.pop(entry.slot, None)
-                            self._mark_cooldown(cfg, self.FAIL_COOLDOWN_S)
+                            self._mark_failed(cfg)
                     abort_event.set()
                     return False
 
@@ -1847,12 +1864,14 @@ class GatewayServer:
                     aborted = await _abort_if_closed(new_cfg, new_bridge)
                     if aborted is not None:
                         return aborted
+                    async with self._lock:
+                        self._fail_streaks.pop(new_cfg, None)
                     return 200, {"ok": True, "proxy": entry.proxy_url}
 
                 async with self._lock:
                     if self._reserved_cfgs.get(entry.slot) == new_cfg:
                         self._reserved_cfgs.pop(entry.slot, None)
-                    self._mark_cooldown(new_cfg, self.FAIL_COOLDOWN_S)
+                    self._mark_failed(new_cfg)
 
             with contextlib.suppress(Exception):
                 await self.slot_manager.stop_slot(entry.slot)
@@ -2662,15 +2681,15 @@ async def _selftest_gateway_async() -> None:
             )
             fake_mgr2.delay_s = 0.0
 
-            # Retry budget cap: > 8 failing configs stops at MAX_LEASE_ATTEMPTS_PER_SLOT (8)
+            # Retry budget cap: > 12 failing configs stops at MAX_LEASE_ATTEMPTS_PER_SLOT / MAX_ROTATE_ATTEMPTS
             with tempfile.TemporaryDirectory() as tmp_cap:
-                for i in range(12):
+                for i in range(16):
                     with open(os.path.join(tmp_cap, f"cfg_{i:02d}_udp.ovpn"), "w", encoding="utf-8") as fh:
                         fh.write("client\n")
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s_cap:
                     s_cap.bind(("127.0.0.1", 0))
                     cap_proxy_port = s_cap.getsockname()[1]
-                cap_mgr = FakeSlotManager(fail_cfgs={f"cfg_{i:02d}_udp.ovpn" for i in range(12)})
+                cap_mgr = FakeSlotManager(fail_cfgs={f"cfg_{i:02d}_udp.ovpn" for i in range(16)})
                 gw_cap = GatewayServer(
                     ovpn_dir=tmp_cap,
                     host="127.0.0.1",
@@ -2775,6 +2794,23 @@ async def _selftest_gateway_async() -> None:
                     gw_rr._cooldowns[gw_rr._configs[-1]] = now_q + 21600.0
                     least_rem = gw_rr._pick_next_config(set(), allow_cooldown_fallback=True)
                     assert least_rem == gw_rr._configs[-2], (least_rem, gw_rr._configs[-2])
+
+                    # Repeat-failure backoff places chronic bad configs behind cleanly-used 6h configs
+                    gw_rr._cooldowns.clear()
+                    gw_rr._fail_streaks.clear()
+                    gw_rr._mark_failed(gw_rr._configs[0])
+                    gw_rr._mark_failed(gw_rr._configs[0])
+                    gw_rr._mark_cooldown(gw_rr._configs[1])
+                    assert gw_rr._cooldowns[gw_rr._configs[0]] > gw_rr._cooldowns[gw_rr._configs[1]] + 1000.0
+                    assert gw_rr._fail_streaks[gw_rr._configs[0]] == 2
+
+                    # Proton Tor exits excluded while Toronto Surfshark node stays intact
+                    with tempfile.TemporaryDirectory() as d_tor:
+                        for fn_t in ("us-co-21-tor.protonvpn.udp.ovpn", "ca-tor.prod.surfshark.com_udp.ovpn"):
+                            with open(os.path.join(d_tor, fn_t), "w", encoding="utf-8") as fh:
+                                fh.write("client\n")
+                        cfgs_tor, _ = discover_ovpn_configs(d_tor)
+                        assert [os.path.basename(x) for x in cfgs_tor] == ["ca-tor.prod.surfshark.com_udp.ovpn"], cfgs_tor
                 finally:
                     await gw_rr.stop()
         finally:
