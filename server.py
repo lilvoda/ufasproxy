@@ -395,6 +395,34 @@ class OvpnSlotManager:
     def _sanitized_cfg_path(self, slot: int) -> str:
         return os.path.abspath(os.path.join(self.state_dir, f"ovns{slot}.ovpn"))
 
+    def _auth_path(self, slot: int) -> str:
+        return os.path.abspath(os.path.join(self.state_dir, f"ovns{slot}.auth"))
+
+    def _prepare_slot_auth(self, slot: int, abs_cfg: str, cfg_txt: str) -> str:
+        """Return per-slot auth file appending Proton +b:N exit suffix when specified in cfg comments."""
+        base_auth = self._cfg_auth.get(abs_cfg, self.auth_file)
+        if not base_auth or not os.path.isfile(base_auth):
+            return base_auth
+        m = re.search(r"(?m)^#.*\+(b:\d+)\b", cfg_txt)
+        if not m:
+            return base_auth
+        suffix = m.group(1)
+        try:
+            with open(base_auth, "r", encoding="utf-8", errors="replace") as fh:
+                lines = [ln.rstrip("\r\n") for ln in fh if ln.strip()]
+        except OSError:
+            return base_auth
+        if len(lines) < 2 or "+b:" in lines[0]:
+            return base_auth
+        os.makedirs(self.state_dir, exist_ok=True)
+        out_path = self._auth_path(slot)
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(out_path)
+        fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(f"{lines[0]}+{suffix}\n{lines[1]}\n")
+        return out_path
+
     def _build_ovpn_cmd(
         self,
         slot: int,
@@ -666,6 +694,8 @@ class OvpnSlotManager:
             os.remove(self._log_path(slot))
         with contextlib.suppress(FileNotFoundError):
             os.remove(self._sanitized_cfg_path(slot))
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(self._auth_path(slot))
         self._slots[slot] = ("", [ms_proc])
         return ms_proc
 
@@ -682,7 +712,7 @@ class OvpnSlotManager:
         with open(san_cfg, "w", encoding="utf-8", errors="replace") as fh:
             fh.write(sanitized_txt)
         log_path = self._log_path(slot)
-        cfg_auth = self._cfg_auth.get(abs_cfg, self.auth_file)
+        cfg_auth = self._prepare_slot_auth(slot, abs_cfg, cfg_txt)
         ovpn_cmd = self._build_ovpn_cmd(slot, abs_cfg, cfg_auth, config_override=san_cfg, is_tcp=is_tcp)
         log_fh = open(log_path, "w", encoding="utf-8", errors="replace")
         try:
@@ -883,6 +913,8 @@ class OvpnSlotManager:
                 os.remove(self._log_path(s))
             with contextlib.suppress(FileNotFoundError):
                 os.remove(self._sanitized_cfg_path(s))
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(self._auth_path(s))
             self._slots.pop(s, None)
             self._slot_killswitch.pop(s, None)
 
@@ -2022,6 +2054,15 @@ async def _selftest_async() -> None:
         with open(bare_cfg, "w", encoding="utf-8") as fh:
             fh.write("client\nauth-user-pass # proton comment\n")
         assert await mgr.start_slot(1, bare_cfg) is False, "expected fail-fast for bare auth-user-pass"
+
+        # 2b. Proton +b:N exit circuit suffix generates per-slot auth without modifying base auth.txt
+        mgr_b = OvpnSlotManager(auth_file=auth2, state_dir=tmp)
+        b_cfg = os.path.join(tmp, "nl-854.protonvpn.udp.ovpn")
+        b_txt = '# Please use "user+b:16" in order to enforce exiting through NL#854.\nclient\n'
+        slot_auth_b = mgr_b._prepare_slot_auth(1, os.path.abspath(b_cfg), b_txt)
+        assert slot_auth_b == mgr_b._auth_path(1)
+        assert open(slot_auth_b, encoding="utf-8").read().splitlines() == ["u+b:16", "p"]
+        assert mgr_b._prepare_slot_auth(1, os.path.abspath(rel_cfg), "client\n") == os.path.abspath(auth2)
 
     # 3. _probe_mt_response_ok status rules
     for ok_code in (100, 200, 204, 301, 302, 401, 404, 418):
