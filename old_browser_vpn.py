@@ -6316,7 +6316,7 @@ async def async_main():
         else:
             combo_path = os.path.join(BASE, combo_path)
     if not args.out:
-        _stem = re.sub(r'[^A-Za-z0-9._-]+', '_', os.path.splitext(os.path.basename(combo_path))[0]).strip('._-') or 'default'
+        _stem = (re.sub(r'[^A-Za-z0-9._-]+', '_', os.path.splitext(os.path.basename(combo_path))[0]).strip('._-')[:64]) or 'default'
         OUTPUT_DIR = os.path.join(BASE, 'output', _stem)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     combos = load_combos(combo_path)

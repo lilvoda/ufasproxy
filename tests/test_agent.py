@@ -169,3 +169,27 @@ def test_agent_dead_pid_tar_symlink_and_reap(tmp_path):
     finally:
         man_proc.terminate()
         man_proc.wait(timeout=5)
+
+    # Whole output/ directory archival collects old + active run folders safely and triggers via COLLECT_OUTPUTS
+    arc_root = tmp_path / "arc_ws"
+    (arc_root / "output" / "batch_old" / "full_info_by_collector").mkdir(parents=True)
+    (arc_root / "output" / "batch_old" / "hit_valid.txt").write_text("a:b|t|1|n|2026\n", encoding="utf-8")
+    (arc_root / "output" / "batch_old" / "full_info_by_collector" / "08_amateur_collector.txt").write_text("CARD\n", encoding="utf-8")
+    (arc_root / "output" / "batch_new").mkdir(parents=True)
+    (arc_root / "output" / "batch_new" / "full_info_upas_valid.txt").write_text("FULL\n", encoding="utf-8")
+    (arc_root / "output" / "batch_empty").mkdir(parents=True)
+    (arc_root / "output" / "batch_empty" / "hit_valid.txt").write_text("", encoding="utf-8")
+    ag4 = MuseAgent(vps_id="vps-4", induk_url="http://127.0.0.1:8000", token="t", work_dir=str(arc_root))
+    arc_uploads = []
+    ag4._http_request_raw = lambda m, p, data=None, content_type="", timeout=15.0: arc_uploads.append((p, data)) or b"{}"
+    assert ag4.collect_all_outputs_sync() is True
+    assert arc_uploads and arc_uploads[0][0] == "/api/v1/agent/outputs-archive"
+    with zipfile.ZipFile(io.BytesIO(arc_uploads[0][1]), "r") as zf:
+        assert set(zf.namelist()) == {
+            "batch_old/hit_valid.txt",
+            "batch_old/full_info_by_collector/08_amateur_collector.txt",
+            "batch_new/full_info_upas_valid.txt",
+        }
+    ok_col, msg_col = ag4.execute_command({"type": "COLLECT_OUTPUTS", "payload": {}})
+    assert ok_col is True and "synced" in msg_col and len(arc_uploads) == 2
+

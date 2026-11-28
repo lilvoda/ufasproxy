@@ -138,28 +138,32 @@ function renderAll() {
       if (el.checked) state.selected.add(el.dataset.id);
       else state.selected.delete(el.dataset.id);
       renderLiveLogs();
+      updateOutNote();
     };
   });
   document.querySelectorAll(".del-vps-btn").forEach((el) => {
     el.onclick = () => window.delVps(el.dataset.id);
   });
   renderLiveLogs();
+  updateOutNote();
+  const chkAll = $("chk-all");
+  if (chkAll) {
+    const total = state.nodes.length;
+    const sel = state.nodes.filter((n) => state.selected.has(n.vps_id)).length;
+    chkAll.checked = total > 0 && sel === total;
+    chkAll.indeterminate = sel > 0 && sel < total;
+  }
+}
+
+function updateOutNote() {
+  const ids = checkedIds();
+  $("out-scope-note").textContent = ids.length
+    ? `Target output.zip: ${ids.length} VPS tercentang (${ids.join(", ")}) — semua folder di output/`
+    : "Target output.zip: Semua VPS terdaftar — semua folder di output/";
 }
 
 function renderJobs() {
-  const sel = $("res-job-select");
-  const prev = sel.value;
-  const opts = [
-    `<option value="__checked_latest__">Gabungan Semua VPS Tercentang (Run Terbaru/Aktif)</option>`,
-    `<option value="__checked_all__">Gabungan Semua VPS Tercentang (Semua Riwayat)</option>`,
-    ...state.jobs.map((j) => {
-      const lbl = j.filename ? `${j.filename} (${j.job_id})` : j.job_id;
-      const tg = j.tg_sent ? " · TG✓" : "";
-      return `<option value="${esc(j.job_id)}">${esc(lbl)} · V:${num(j.valid_count)} 2FA:${num(j.otp_count)}${tg}</option>`;
-    }),
-  ];
-  sel.innerHTML = opts.join("");
-  if (prev && [...sel.options].some((o) => o.value === prev)) sel.value = prev;
+  updateOutNote();
 }
 
 window.delVps = async (vid) => {
@@ -221,7 +225,11 @@ async function connectWs() {
   ws.onmessage = (ev) => {
     const msg = JSON.parse(ev.data);
     if (msg.type === "snapshot") { state.nodes = msg.nodes || []; state.summary = msg.summary || {}; renderAll(); }
-    else if (msg.type === "hits_added" || msg.type === "job_output_ready") { loadJobs(); }
+    else if (msg.type === "hits_added") { loadJobs(); }
+    else if (msg.type === "job_output_ready") {
+      if (msg.job_id === "output.zip" && msg.vps_id) $("sys-msg").textContent = `Archive output/ VPS ${msg.vps_id} tersinkron ✓`;
+      loadJobs();
+    }
     else if (msg.type === "provision_log") { $("prov-log").textContent += msg.line + "\n"; $("prov-log").scrollTop = $("prov-log").scrollHeight; }
   };
 }
@@ -320,60 +328,58 @@ $("prov-btn").onclick = async () => {
   } catch (e) { $("prov-log").textContent = `ERROR: ${e.message}`; }
 };
 
-$("refresh-jobs-btn").onclick = loadJobs;
+$("sync-out-btn").onclick = async () => {
+  const btn = $("sync-out-btn");
+  btn.disabled = true;
+  try {
+    const ids = checkedIds();
+    const target = ids.length ? ids : state.nodes.map((n) => n.vps_id);
+    if (!target.length) return alert("Belum ada VPS terdaftar.");
+    const res = await api("/api/v1/commands/bulk", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ vps_ids: target, type: "COLLECT_OUTPUTS", payload: {} }),
+    });
+    $("sys-msg").textContent = `Sync folder output/ diminta ke ${res.queued.length} VPS...`;
+  } catch (e) { alert(e.message); }
+  finally { btn.disabled = false; }
+};
 
 $("download-zip-btn").onclick = async () => {
+  const btn = $("download-zip-btn");
+  btn.disabled = true;
   try {
-    const selVal = $("res-job-select").value || "__checked_latest__";
-    let res;
-    let fallbackName = `${selVal}.zip`;
-    if (selVal === "__checked_latest__" || selVal === "__checked_all__") {
-      const vps_ids = checkedIds();
-      if (!vps_ids.length) return alert("Centang minimal 1 VPS.");
-      const scope = selVal === "__checked_all__" ? "all" : "latest";
-      fallbackName = `output_${vps_ids.length}vps.zip`;
-      res = await fetch("/api/v1/results/checked/zip", {
-        method: "POST",
-        headers: headers({ "Content-Type": "application/json" }),
-        body: JSON.stringify({ vps_ids, scope }),
-      });
-    } else {
-      res = await fetch(`/api/v1/results/${encodeURIComponent(selVal)}/zip`, { headers: headers() });
-    }
+    const res = await fetch("/api/v1/results/output.zip", {
+      method: "POST",
+      headers: headers({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ vps_ids: checkedIds() }),
+    });
     if (res.status === 401) clearAuth("Session expired");
     if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
     const blob = await res.blob();
-    const disp = res.headers.get("content-disposition") || "";
-    const m = disp.match(/filename="([^"]+)"/);
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = (m && m[1]) ? m[1] : fallbackName;
+    a.download = "output.zip";
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   } catch (e) { alert(e.message); }
+  finally { btn.disabled = false; }
 };
 
 $("send-tg-btn").onclick = async () => {
+  const btn = $("send-tg-btn");
+  btn.disabled = true;
   try {
-    const selVal = $("res-job-select").value || "__checked_latest__";
-    let res;
-    if (selVal === "__checked_latest__" || selVal === "__checked_all__") {
-      const vps_ids = checkedIds();
-      if (!vps_ids.length) return alert("Centang minimal 1 VPS.");
-      const scope = selVal === "__checked_all__" ? "all" : "latest";
-      res = await api("/api/v1/results/checked/telegram", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ vps_ids, scope }),
-      });
-    } else {
-      res = await api(`/api/v1/results/${encodeURIComponent(selVal)}/telegram`, { method: "POST" });
-    }
+    const res = await api("/api/v1/results/output-zip/telegram", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ vps_ids: checkedIds() }),
+    });
     if (!res.ok) throw new Error("Telegram API gagal");
-    $("sys-msg").textContent = `Zip ${res.zip_name} terkirim ke Telegram ✓`;
-    await loadJobs();
+    $("sys-msg").textContent = `output.zip (${res.counts.folders} folder) terkirim ke Telegram ✓`;
   } catch (e) { alert(e.message); }
+  finally { btn.disabled = false; }
 };
 
 $("backup-btn").onclick = async () => {

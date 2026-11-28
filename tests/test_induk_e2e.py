@@ -15,6 +15,7 @@ def test_static_ui_and_full_dispatch_hit_flow(tmp_path):
         html = client.get("/").text
         assert "run-workers" in html and "run-two-tab" in html
         assert "download-zip-btn" in html and "send-tg-btn" in html
+        assert "sync-out-btn" in html and "out-scope-note" in html
         assert "prov-induk-url" not in html and "prov-ptr-url" not in html
         assert "smart-panel" not in html and "Rotate VPN" not in html
         assert client.get("/static/app.js").status_code == 200
@@ -250,3 +251,121 @@ def test_job_output_zip_and_telegram_auto_and_manual_send(tmp_path, monkeypatch)
             names = set(zf.namelist())
             assert {"summary.txt", "full_info_upas_valid.txt", "full_info_by_collector/08_amateur_collector.txt"}.issubset(names)
             assert "Full Info: 1" in zf.read("summary.txt").decode("utf-8")
+
+
+def test_single_output_zip_aggregation(tmp_path, monkeypatch):
+    app = create_app(
+        db_path=str(tmp_path / "induk.db"),
+        api_key="k",
+        data_dir=str(tmp_path),
+        repo_dir=str(tmp_path),
+        tg_token="tg-tok",
+        tg_chat_id="tg-chat",
+    )
+    tg_calls = []
+    monkeypatch.setattr(app_mod, "_send_telegram_zip_sync", lambda t, c, fn, b, cap="": tg_calls.append((fn, b, cap)) or {"ok": True})
+
+    with TestClient(app) as client:
+        hdr = {"X-API-Key": "k"}
+        t1 = client.post("/api/v1/vps", json={"vps_id": "vps-1"}, headers=hdr).json()["agent_token"]
+        t2 = client.post("/api/v1/vps", json={"vps_id": "vps-2"}, headers=hdr).json()["agent_token"]
+
+        # Reject invalid archive paths / unsupported files
+        bad_buf = io.BytesIO()
+        with zipfile.ZipFile(bad_buf, "w") as zf:
+            zf.writestr("../evil/hit_valid.txt", "x\n")
+        assert client.post(
+            "/api/v1/agent/outputs-archive",
+            content=bad_buf.getvalue(),
+            headers={"Authorization": f"Bearer {t1}", "Content-Type": "application/zip"},
+        ).status_code == 400
+
+        card_a = "\n".join(["STATUS       : [NOT BANNED]", "  User:Pass  : u1:p1", "", "-" * 60, ""])
+        card_b = "\n".join(["STATUS       : [NOT BANNED]", "  User:Pass  : u2:p2", "", "-" * 60, ""])
+
+        z1 = io.BytesIO()
+        with zipfile.ZipFile(z1, "w") as zf:
+            zf.writestr("combo_a/hit_valid.txt", "u1:p1|t|1|H1|2026\n")
+            zf.writestr("combo_a/full_info_upas_valid.txt", card_a)
+            zf.writestr("combo_a/full_info_by_collector/08_amateur_collector.txt", card_a)
+            zf.writestr("combo_old/hit_valid.txt", "old1:p1|t|1|O1|2026\n")
+        assert client.post(
+            "/api/v1/agent/outputs-archive",
+            content=z1.getvalue(),
+            headers={"Authorization": f"Bearer {t1}", "Content-Type": "application/zip"},
+        ).status_code == 200
+
+        # vps-2 also contributes duplicate + unique lines inside combo_a and a separate combo_b
+        z2 = io.BytesIO()
+        with zipfile.ZipFile(z2, "w") as zf:
+            zf.writestr("combo_a/hit_valid.txt", "u1:p1|t|1|H1|2026\nu2:p2|t|1|H2|2026\n")
+            zf.writestr("combo_a/full_info_upas_valid.txt", card_a + card_b)
+            zf.writestr("combo_b/hit_2fa.txt", "u3:p3|2026\n")
+        assert client.post(
+            "/api/v1/agent/outputs-archive",
+            content=z2.getvalue(),
+            headers={"Authorization": f"Bearer {t2}", "Content-Type": "application/zip"},
+        ).status_code == 200
+
+        # Download output.zip scoped to vps-1 only vs all VPS
+        dl1 = client.post("/api/v1/results/output.zip", json={"vps_ids": ["vps-1"]}, headers=hdr)
+        assert dl1.status_code == 200 and 'filename="output.zip"' in dl1.headers.get("content-disposition", "")
+        with zipfile.ZipFile(io.BytesIO(dl1.content), "r") as zf:
+            names1 = set(zf.namelist())
+            assert "combo_a/hit_valid.txt" in names1 and "combo_old/hit_valid.txt" in names1
+            assert "combo_b/hit_2fa.txt" not in names1
+
+        # Dispatched job present in BOTH jobs/<jid>/outputs AND vps_outputs/<vid>.zip merges into ONE folder (no dup)
+        disp = client.post(
+            "/api/v1/jobs/dispatch",
+            json={"vps_ids": ["vps-1"], "combo_text": "d1:p1", "workers": "auto", "two_tab": True, "filename": "arch_live.txt"},
+            headers=hdr,
+        )
+        assert disp.status_code == 200
+        jid_live = disp.json()["job_id"]
+        jl_buf = io.BytesIO()
+        with zipfile.ZipFile(jl_buf, "w") as zf:
+            zf.writestr("hit_valid.txt", "d1:p1|t|1|DL|2026\n")
+        assert client.post(
+            f"/api/v1/agent/output/{jid_live}",
+            content=jl_buf.getvalue(),
+            headers={"Authorization": f"Bearer {t1}", "Content-Type": "application/zip"},
+        ).status_code == 200
+        z1_both = io.BytesIO()
+        with zipfile.ZipFile(z1_both, "w") as zf:
+            zf.writestr("combo_a/hit_valid.txt", "u1:p1|t|1|H1|2026\n")
+            zf.writestr("combo_a/full_info_upas_valid.txt", card_a)
+            zf.writestr("combo_a/full_info_by_collector/08_amateur_collector.txt", card_a)
+            zf.writestr("combo_old/hit_valid.txt", "old1:p1|t|1|O1|2026\n")
+            zf.writestr(f"{jid_live}/hit_valid.txt", "d1:p1|t|1|DL|2026\n")
+        assert client.post(
+            "/api/v1/agent/outputs-archive",
+            content=z1_both.getvalue(),
+            headers={"Authorization": f"Bearer {t1}", "Content-Type": "application/zip"},
+        ).status_code == 200
+
+        dl_all = client.post("/api/v1/results/output.zip", json={"vps_ids": []}, headers=hdr)
+        assert dl_all.status_code == 200
+        with zipfile.ZipFile(io.BytesIO(dl_all.content), "r") as zf:
+            names_all = set(zf.namelist())
+            assert {
+                "summary.txt",
+                "arch_live/hit_valid.txt",
+                "combo_a/hit_valid.txt",
+                "combo_a/full_info_upas_valid.txt",
+                "combo_a/full_info_by_collector/08_amateur_collector.txt",
+                "combo_old/hit_valid.txt",
+                "combo_b/hit_2fa.txt",
+            }.issubset(names_all)
+            assert f"{jid_live}/hit_valid.txt" not in names_all
+            assert zf.read("arch_live/hit_valid.txt").decode("utf-8").splitlines() == ["d1:p1|t|1|DL|2026"]
+            lines_a = zf.read("combo_a/hit_valid.txt").decode("utf-8").splitlines()
+            assert lines_a == ["u1:p1|t|1|H1|2026", "u2:p2|t|1|H2|2026"]
+            full_a = zf.read("combo_a/full_info_upas_valid.txt").decode("utf-8")
+            assert full_a.count("STATUS       : [NOT BANNED]") == 2
+            assert "combo_a" in zf.read("summary.txt").decode("utf-8")
+
+        tg_res = client.post("/api/v1/results/output-zip/telegram", json={"vps_ids": []}, headers=hdr)
+        assert tg_res.status_code == 200 and tg_res.json()["zip_name"] == "output.zip"
+        assert tg_calls and tg_calls[-1][0] == "output.zip"
+
