@@ -10,20 +10,30 @@ DEFAULT_TG_TOKEN="8784287033:AAEyIpriTua1m4th50iBEAxggmJHJOx5vKg"
 DEFAULT_TG_CHAT_ID="8339459756"
 DEFAULT_TG_INTERVAL="15"
 
-MODE=""
+DO_CLIENT=0
+DO_SERVER=0
+DO_INDUK=0
 ARG_URL="${UFASPROXY_URL:-}"
 ARG_TOKEN="${UFASPROXY_TOKEN:-}"
 ARG_TG_TOKEN="${UFASPROXY_TG_TOKEN:-}"
 ARG_TG_CHAT_ID="${UFASPROXY_TG_CHAT_ID:-}"
 ARG_TG_INTERVAL="${UFASPROXY_TG_INTERVAL:-}"
+INDUK_PORT="${INDUK_PORT:-8000}"
+ARG_INDUK_API_KEY="${INDUK_API_KEY:-}"
+RESTORE_BUNDLE=""
+INDUK_URL="${INDUK_URL:-}"
+AGENT_TOKEN="${AGENT_TOKEN:-}"
+VPS_ID="${VPS_ID:-}"
+INDUK_POINTER_URL="${INDUK_POINTER_URL:-}"
 ROLL_TOKEN=0
 NO_GIT_PUSH=0
 DO_RESTART=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --client|-c)   MODE="client"; shift ;;
-    --server|-s)   MODE="server"; shift ;;
-    --all|-a)      MODE="all"; shift ;;
+    --client|-c)   DO_CLIENT=1; shift ;;
+    --server|-s)   DO_SERVER=1; shift ;;
+    --induk|-i)    DO_INDUK=1; shift ;;
+    --all|-a)      DO_SERVER=1; DO_INDUK=1; DO_CLIENT=1; shift ;;
     --roll-token)  ROLL_TOKEN=1; shift ;;
     --no-git-push) NO_GIT_PUSH=1; shift ;;
     --restart)     DO_RESTART=1; shift ;;
@@ -42,34 +52,64 @@ while [[ $# -gt 0 ]]; do
     --tg-interval)
       [[ $# -ge 2 ]] || { echo "Error: --tg-interval requires a value" >&2; exit 1; }
       ARG_TG_INTERVAL="$2"; shift 2 ;;
+    --induk-port)
+      [[ $# -ge 2 ]] || { echo "Error: --induk-port requires a value" >&2; exit 1; }
+      INDUK_PORT="$2"; shift 2 ;;
+    --induk-api-key)
+      [[ $# -ge 2 ]] || { echo "Error: --induk-api-key requires a value" >&2; exit 1; }
+      ARG_INDUK_API_KEY="$2"; shift 2 ;;
+    --restore)
+      [[ $# -ge 2 ]] || { echo "Error: --restore requires a value" >&2; exit 1; }
+      RESTORE_BUNDLE="$2"; shift 2 ;;
+    --induk-url)
+      [[ $# -ge 2 ]] || { echo "Error: --induk-url requires a value" >&2; exit 1; }
+      INDUK_URL="$2"; shift 2 ;;
+    --agent-token)
+      [[ $# -ge 2 ]] || { echo "Error: --agent-token requires a value" >&2; exit 1; }
+      AGENT_TOKEN="$2"; shift 2 ;;
+    --vps-id)
+      [[ $# -ge 2 ]] || { echo "Error: --vps-id requires a value" >&2; exit 1; }
+      VPS_ID="$2"; shift 2 ;;
+    --induk-pointer-url)
+      [[ $# -ge 2 ]] || { echo "Error: --induk-pointer-url requires a value" >&2; exit 1; }
+      INDUK_POINTER_URL="$2"; shift 2 ;;
     -h|--help)
-      echo "Usage: bash install.sh [--client | --server | --all] [--url URL] [--token TOKEN] [--tg-token BOT_TOKEN] [--tg-chat-id CHAT_ID] [--tg-interval SEC] [--roll-token] [--no-git-push] [--restart]"
+      echo "Usage: bash install.sh [--client] [--server] [--induk] [--all] [--url URL] [--token TOKEN] [--tg-token BOT_TOKEN] [--tg-chat-id CHAT_ID] [--tg-interval SEC] [--induk-port PORT] [--induk-api-key KEY] [--restore BUNDLE] [--induk-url URL --agent-token TOK --vps-id ID] [--roll-token] [--no-git-push] [--restart]"
       exit 0
       ;;
     *)
-      echo "Error: unknown option '$1' (use --client, --server, or --all)" >&2
+      echo "Error: unknown option '$1' (use --client, --server, --induk, or --all)" >&2
       exit 1
       ;;
   esac
 done
 
-if [[ -z "$MODE" ]]; then
+if [[ "$DO_CLIENT$DO_SERVER$DO_INDUK" == "000" ]]; then
   if [[ -t 0 ]]; then
     echo "Pilih mode install ufasproxy:"
-    echo "  [1] Client Checker (old_browser_vpn.py - untuk CT / worker)"
-    echo "  [2] Server Gateway (server.py - untuk VPS OpenVPN)"
-    echo "  [3] Keduanya (Server + Client)"
-    read -r -p "Pilihan (1-3) [1]: " _sel || true
+    echo "  [1] Client Checker (old_browser_vpn.py + opsional agent Induk)"
+    echo "  [2] Server VPN Gateway (server.py :8080)"
+    echo "  [3] Server Induk Controller (induk.app:app :8000 - kontrol multi-VPS)"
+    echo "  [4] Server VPN + Server Induk (1 VPS)"
+    echo "  [5] Semua (Server VPN + Server Induk + Client)"
+    read -r -p "Pilihan (1-5) [1]: " _sel || true
     case "${_sel:-1}" in
-      1|client) MODE="client" ;;
-      2|server) MODE="server" ;;
-      3|all)    MODE="all" ;;
+      1|client) DO_CLIENT=1 ;;
+      2|server) DO_SERVER=1 ;;
+      3|induk)  DO_INDUK=1 ;;
+      4)        DO_SERVER=1; DO_INDUK=1 ;;
+      5|all)    DO_SERVER=1; DO_INDUK=1; DO_CLIENT=1 ;;
       *) echo "Error: pilihan tidak valid: $_sel" >&2; exit 1 ;;
     esac
   else
-    echo "Error: non-interactive shell requires --client, --server, or --all" >&2
+    echo "Error: non-interactive shell requires --client, --server, --induk, or --all" >&2
     exit 1
   fi
+fi
+
+if [[ -n "$INDUK_URL" || -n "$AGENT_TOKEN" ]] && [[ -z "$INDUK_URL" || -z "$AGENT_TOKEN" ]]; then
+  echo "Error: --induk-url dan --agent-token harus diisi bersama" >&2
+  exit 1
 fi
 
 SUDO=""
@@ -198,13 +238,57 @@ _read_env_val() {
 
 _norm_url() {
   local u="${1//[[:space:]]/}"
+  local def_port="${2:-8080}"
   [[ -n "$u" ]] || return 0
   [[ "$u" =~ ^https?:// ]] || u="http://$u"
   u="${u%/}"
   if [[ "$u" == http://* && "${u#http://}" != *:* ]]; then
-    u="$u:8080"
+    u="$u:$def_port"
   fi
   printf '%s' "$u"
+}
+
+_write_secret_file() {
+  local dst="$1" payload="$2" use_sudo="${3:-0}"
+  local dir old_u tmp_f
+  dir="$(dirname -- "$dst")"
+  old_u="$(umask)"
+  umask 077
+  tmp_f="$(mktemp)"
+  printf '%s\n' "$payload" > "$tmp_f"
+  chmod 600 "$tmp_f"
+  umask "$old_u"
+  if [[ "$use_sudo" -eq 1 && "$SUDO" != "__NEED_ROOT__" ]]; then
+    $SUDO mkdir -p "$dir"
+    $SUDO install -m 600 "$tmp_f" "$dst"
+    rm -f "$tmp_f"
+  else
+    mkdir -p "$dir"
+    mv -f "$tmp_f" "$dst"
+    chmod 600 "$dst" 2>/dev/null || true
+  fi
+}
+
+validate_induk_port() {
+  if ! [[ "$INDUK_PORT" =~ ^[0-9]+$ ]] || (( INDUK_PORT < 1025 || INDUK_PORT > 65535 )); then
+    echo "Error: --induk-port must be in 1025..65535 (got: $INDUK_PORT)" >&2
+    exit 1
+  fi
+  local gw_port=8080 gw_base=20001 gw_max=45
+  if [[ -f /etc/systemd/system/ufasproxy.service ]]; then
+    local ex
+    ex="$(cat /etc/systemd/system/ufasproxy.service 2>/dev/null || true)"
+    if [[ "$ex" =~ --port[[:space:]]+([0-9]+) ]]; then gw_port="${BASH_REMATCH[1]}"; fi
+    if [[ "$ex" =~ --base-proxy-port[[:space:]]+([0-9]+) ]]; then gw_base="${BASH_REMATCH[1]}"; fi
+    if [[ "$ex" =~ --max-slots[[:space:]]+([0-9]+) ]]; then gw_max="${BASH_REMATCH[1]}"; fi
+  fi
+  local gw_end=$(( gw_base + gw_max - 1 ))
+  if [[ "$DO_SERVER" -eq 1 || -f /etc/systemd/system/ufasproxy.service ]]; then
+    if (( INDUK_PORT == gw_port || (INDUK_PORT >= gw_base && INDUK_PORT <= gw_end) )); then
+      echo "Error: --induk-port $INDUK_PORT collides with Gateway VPN ports ($gw_port / $gw_base..$gw_end)" >&2
+      exit 1
+    fi
+  fi
 }
 
 write_token_env() {
@@ -228,7 +312,8 @@ write_token_env() {
   tg_chat="${tg_chat//$'\n'/}"
   tg_int="${tg_int//$'\r'/}"
   tg_int="${tg_int//$'\n'/}"
-  local tmp_env
+  local tmp_env old_u
+  old_u="$(umask)"
   umask 077
   tmp_env="$(mktemp "$SCRIPT_DIR/.token.env.XXXXXX")"
   {
@@ -245,6 +330,7 @@ write_token_env() {
     fi
   } > "$tmp_env"
   chmod 600 "$tmp_env" 2>/dev/null || true
+  umask "$old_u"
   mv -f "$tmp_env" "$TOKEN_FILE"
 }
 
@@ -474,6 +560,127 @@ Optional: --roll-token, --no-git-push, --tg-token, --tg-chat-id, --tg-interval, 
 EOF
 }
 
+install_induk() {
+  echo "[*] Installing ufasproxy INDUK Controller prerequisites..."
+  validate_induk_port
+
+  echo "[1/4] Checking Python 3.10+, venv, git, and curl..."
+  local py_bin
+  py_bin="$(command -v python3 || command -v python || true)"
+  if [[ -z "$py_bin" ]] || ! "$py_bin" -c "import ensurepip" >/dev/null 2>&1; then
+    pkg_install_group python
+    py_bin="$(command -v python3 || command -v python || true)"
+  fi
+  if ! command -v git >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
+    pkg_install git curl
+  fi
+  if [[ -z "$py_bin" ]] || ! "$py_bin" -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)" >/dev/null 2>&1; then
+    echo "Error: Python 3.10+ required" >&2
+    exit 1
+  fi
+
+  echo "[2/4] Setting up .venv_induk and Induk packages..."
+  if [[ ! -x "$SCRIPT_DIR/.venv_induk/bin/python" ]] || ! "$SCRIPT_DIR/.venv_induk/bin/python" -m pip --version >/dev/null 2>&1; then
+    rm -rf "$SCRIPT_DIR/.venv_induk"
+    "$py_bin" -m venv "$SCRIPT_DIR/.venv_induk"
+  fi
+  local ivpy="$SCRIPT_DIR/.venv_induk/bin/python"
+  "$ivpy" -m pip install --upgrade pip setuptools wheel
+  "$ivpy" -m pip install -r "$SCRIPT_DIR/induk/requirements_induk.txt"
+
+  echo "[3/4] Running Induk controller self-tests..."
+  PYTHONPATH="$SCRIPT_DIR" "$ivpy" -m pytest \
+    "$SCRIPT_DIR/tests/test_induk_db.py" \
+    "$SCRIPT_DIR/tests/test_induk_api.py" \
+    "$SCRIPT_DIR/tests/test_induk_e2e.py" \
+    "$SCRIPT_DIR/tests/test_migration.py" \
+    "$SCRIPT_DIR/tests/test_splitters_provisioner.py" \
+    "$SCRIPT_DIR/tests/test_audit_fixes.py" -q
+
+  echo "[4/4] Initializing induk_data, env, and service..."
+  mkdir -p "$SCRIPT_DIR/induk_data"
+  if [[ -n "$RESTORE_BUNDLE" ]]; then
+    if [[ ! -f "$RESTORE_BUNDLE" ]]; then
+      echo "Error: restore bundle not found: $RESTORE_BUNDLE" >&2
+      exit 1
+    fi
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]] && [[ "$SUDO" != "__NEED_ROOT__" ]]; then
+      $SUDO systemctl stop ufasproxy-induk.service 2>/dev/null || true
+    fi
+    echo "[*] Restoring backup $RESTORE_BUNDLE..."
+    rm -f "$SCRIPT_DIR/induk_data/induk.db-wal" "$SCRIPT_DIR/induk_data/induk.db-shm"
+    "$ivpy" - "$RESTORE_BUNDLE" "$SCRIPT_DIR/induk_data" << 'PY'
+import os, sys, tarfile
+bundle, dest = sys.argv[1], sys.argv[2]
+with tarfile.open(bundle, "r:gz") as tf:
+    members = []
+    for m in tf.getmembers():
+        norm = os.path.normpath(m.name)
+        if norm.startswith("..") or os.path.isabs(norm) or norm == ".":
+            raise SystemExit(f"Unsafe archive path: {m.name}")
+        if not (m.isreg() or m.isdir()):
+            raise SystemExit(f"Unsafe archive entry type: {m.name}")
+        m.mode &= 0o777
+        members.append(m)
+    tf.extractall(dest, members=members)
+PY
+  fi
+
+  local env_dir="/etc/ufasproxy-induk"
+  local env_file="$env_dir/env"
+  local use_sudo=1
+  if [[ "$SUDO" == "__NEED_ROOT__" ]]; then
+    env_dir="$SCRIPT_DIR/induk_data"
+    env_file="$env_dir/induk.env"
+    use_sudo=0
+  fi
+
+  local api_key="${ARG_INDUK_API_KEY:-}"
+  if [[ -z "$api_key" ]]; then
+    if [[ "$use_sudo" -eq 1 && -f "$env_file" ]]; then
+      api_key="$($SUDO awk -F= '$1=="INDUK_API_KEY"{print substr($0,index($0,"=")+1); exit}' "$env_file" 2>/dev/null || true)"
+    elif [[ -f "$env_file" ]]; then
+      api_key="$(awk -F= '$1=="INDUK_API_KEY"{print substr($0,index($0,"=")+1); exit}' "$env_file" 2>/dev/null || true)"
+    fi
+  fi
+  if [[ -z "$api_key" ]]; then
+    api_key="$("$ivpy" -c "import secrets; print(secrets.token_urlsafe(24))")"
+  fi
+
+  local env_payload
+  env_payload="$(printf 'INDUK_API_KEY=%s\nINDUK_DATA_DIR=%s\nINDUK_REPO_DIR=%s\nINDUK_PORT=%s' \
+    "$api_key" "$SCRIPT_DIR/induk_data" "$SCRIPT_DIR" "$INDUK_PORT")"
+  _write_secret_file "$env_file" "$env_payload" "$use_sudo"
+
+  if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]] && [[ "$SUDO" != "__NEED_ROOT__" ]]; then
+    cat <<EOF | $SUDO tee /etc/systemd/system/ufasproxy-induk.service >/dev/null
+[Unit]
+Description=ufasproxy Induk Multi-VPS Controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory="$SCRIPT_DIR"
+EnvironmentFile="$env_file"
+ExecStart="$SCRIPT_DIR/.venv_induk/bin/uvicorn" induk.app:app --host 0.0.0.0 --port $INDUK_PORT
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    $SUDO systemctl daemon-reload
+    $SUDO systemctl enable ufasproxy-induk.service >/dev/null 2>&1 || true
+    $SUDO systemctl restart ufasproxy-induk.service
+    echo "[OK] ufasproxy-induk.service aktif di port $INDUK_PORT ✓"
+  else
+    echo "[OK] ufasproxy INDUK ready (systemd tidak aktif; jalankan manual):"
+    echo "  set -a && source \"$env_file\" && set +a && \"$SCRIPT_DIR/.venv_induk/bin/uvicorn\" induk.app:app --host 0.0.0.0 --port $INDUK_PORT"
+  fi
+  echo "INDUK env saved -> $env_file (chmod 600)"
+}
+
 install_client() {
   echo "[*] Installing ufasproxy CLIENT checker prerequisites..."
 
@@ -521,11 +728,98 @@ install_client() {
   echo "[4/4] Running old_browser_vpn.py --selftest..."
   "$vpy" "$SCRIPT_DIR/old_browser_vpn.py" --selftest
 
-  local cli_url cli_tok
-  cli_url="${ARG_URL:-$DEFAULT_URL}"
-  cli_tok="${ARG_TOKEN:-$DEFAULT_TOKEN}"
-  write_token_env "$cli_url" "$cli_tok"
-  echo "[*] Konfigurasi API disimpan -> $TOKEN_FILE"
+  local cur_u cur_t cli_url cli_tok
+  cur_u="$(_read_env_val UFASPROXY_URL)"
+  cur_t="$(_read_env_val UFASPROXY_TOKEN)"
+  cli_url="${ARG_URL:-$cur_u}"
+  [[ -n "$cli_url" ]] || cli_url="$DEFAULT_URL"
+  cli_tok="${ARG_TOKEN:-$cur_t}"
+  [[ -n "$cli_tok" ]] || cli_tok="$DEFAULT_TOKEN"
+  if [[ "${cli_url,,}" == "off" || "${cli_url,,}" == "none" ]]; then
+    cli_url=""
+  fi
+  if [[ -n "$cli_url" ]]; then
+    write_token_env "$cli_url" "$cli_tok"
+    cli_url="$(_read_env_val UFASPROXY_URL)"
+    echo "[*] Konfigurasi API disimpan -> $TOKEN_FILE"
+  fi
+
+  if [[ -t 0 && -z "$INDUK_URL" && -z "$AGENT_TOKEN" ]]; then
+    read -r -p "Hubungkan worker ke Server Induk? INDUK_URL (Enter untuk lewati): " _in_induk_url || true
+    if [[ -n "${_in_induk_url:-}" ]]; then
+      INDUK_URL="$_in_induk_url"
+      read -r -s -p "Agent Token dari Induk: " _in_ag_tok || true
+      echo ""
+      AGENT_TOKEN="${_in_ag_tok:-}"
+      read -r -p "VPS ID [$(hostname 2>/dev/null || echo worker-1)]: " _in_vid || true
+      [[ -n "${_in_vid:-}" ]] && VPS_ID="$_in_vid"
+      read -r -p "INDUK_POINTER_URL (opsional): " _in_ptr || true
+      [[ -n "${_in_ptr:-}" ]] && INDUK_POINTER_URL="$_in_ptr"
+    fi
+  fi
+
+  if [[ -n "$INDUK_URL" || -n "$AGENT_TOKEN" ]]; then
+    if [[ -z "$INDUK_URL" || -z "$AGENT_TOKEN" ]]; then
+      echo "Error: --induk-url dan --agent-token harus diisi bersama" >&2
+      exit 1
+    fi
+    INDUK_URL="${INDUK_URL//$'\r'/}"; INDUK_URL="${INDUK_URL//$'\n'/}"
+    INDUK_URL="$(_norm_url "$INDUK_URL" 8000)"
+    AGENT_TOKEN="${AGENT_TOKEN//$'\r'/}"; AGENT_TOKEN="${AGENT_TOKEN//$'\n'/}"
+    INDUK_POINTER_URL="${INDUK_POINTER_URL//$'\r'/}"; INDUK_POINTER_URL="${INDUK_POINTER_URL//$'\n'/}"
+
+    "$vpy" -m pip install --upgrade "websockets>=13.0"
+    git config --global --add safe.directory "$SCRIPT_DIR" 2>/dev/null || true
+    local vid="${VPS_ID:-$(hostname 2>/dev/null || echo worker-1)}"
+    local ag_dir="/etc/ufasproxy-agent"
+    local ag_env="$ag_dir/env"
+    local ag_sudo=1
+    if [[ "$SUDO" == "__NEED_ROOT__" ]]; then
+      ag_dir="$SCRIPT_DIR/.agent_state"
+      ag_env="$ag_dir/agent.env"
+      ag_sudo=0
+    fi
+    local ag_payload
+    ag_payload="$(printf 'VPS_ID=%s\nINDUK_URL=%s\nAGENT_TOKEN=%s\nWORK_DIR=%s\nENV_FILE=%s\nINDUK_POINTER_URL=%s\nUFASPROXY_URL=%s' \
+      "$vid" "$INDUK_URL" "$AGENT_TOKEN" "$SCRIPT_DIR" "$ag_env" "$INDUK_POINTER_URL" "$cli_url")"
+    _write_secret_file "$ag_env" "$ag_payload" "$ag_sudo"
+
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]] && [[ "$SUDO" != "__NEED_ROOT__" ]]; then
+      $SUDO mkdir -p /etc/systemd/journald.conf.d
+      cat <<EOF | $SUDO tee /etc/systemd/journald.conf.d/ufasproxy.conf >/dev/null
+[Journal]
+SystemMaxUse=100M
+MaxRetentionSec=7day
+EOF
+      $SUDO systemctl restart systemd-journald || true
+      cat <<EOF | $SUDO tee /etc/systemd/system/ufasproxy-agent.service >/dev/null
+[Unit]
+Description=ufasproxy Worker Agent ($vid)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory="$SCRIPT_DIR"
+EnvironmentFile="$ag_env"
+ExecStart="$SCRIPT_DIR/.venv/bin/python" "$SCRIPT_DIR/agent.py"
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+      $SUDO systemctl daemon-reload
+      $SUDO systemctl enable ufasproxy-agent.service >/dev/null 2>&1 || true
+      $SUDO systemctl restart ufasproxy-agent.service
+      echo "[OK] ufasproxy-agent.service aktif ($vid -> $INDUK_URL) ✓"
+    else
+      echo "[OK] Agent config saved -> $ag_env (systemd tidak aktif; jalankan manual):"
+      echo "  set -a && source \"$ag_env\" && set +a && \"$vpy\" \"$SCRIPT_DIR/agent.py\""
+    fi
+  fi
 
   cat <<EOF
 
@@ -538,8 +832,15 @@ Tip: jika pindah server/token nanti, jalankan:
 EOF
 }
 
-case "$MODE" in
-  client) install_client ;;
-  server) install_server ;;
-  all)    install_server; install_client ;;
-esac
+if [[ "$DO_INDUK" -eq 1 ]]; then
+  validate_induk_port
+fi
+if [[ "$DO_SERVER" -eq 1 ]]; then
+  install_server
+fi
+if [[ "$DO_INDUK" -eq 1 ]]; then
+  install_induk
+fi
+if [[ "$DO_CLIENT" -eq 1 ]]; then
+  install_client
+fi

@@ -2314,11 +2314,137 @@ async def _probe_direct_moonton_ms(timeout_s: float = 6.0) -> tuple[bool, str, i
     except Exception as e:
         return False, str(e)[:48] or "Connection failed", 99999
 
+def _resolve_host_ipv4(host: str) -> str:
+    """Resolve hostname/URL Induk menjadi IPv4 untuk bypass route non-tunnel."""
+    raw = (host or '').strip()
+    if not raw:
+        return ''
+    if '://' in raw:
+        raw = urllib.parse.urlparse(raw).hostname or ''
+    elif ':' in raw and raw.count(':') == 1:
+        raw = raw.split(':', 1)[0]
+    raw = raw.strip('[] ')
+    if not raw:
+        return ''
+    try:
+        import socket
+        return socket.gethostbyname(raw)
+    except Exception:
+        return ''
+
+
+def _build_induk_bypass_route_cmd(induk_ip: str, dev: str, gw: str = '') -> list[str]:
+    if gw:
+        return ['route', 'replace', f'{induk_ip}/32', 'via', gw, 'dev', dev]
+    return ['route', 'replace', f'{induk_ip}/32', 'dev', dev]
+
+
+def _build_status_snapshot(
+    stats_dict: dict,
+    perf,
+    vpn_coord=None,
+    top_hits=None,
+    live_logs=None,
+    last_heal: dict | None = None,
+    live_pool=None,
+    vpnpool_cfg=None,
+) -> dict:
+    is_drop, tag, desc, pct, cur_r, peak_r = perf.evaluate()
+    ck = int(stats_dict.get('checked') or 0)
+    tot = int(stats_dict.get('total') or 0)
+    elapsed = max(time.time() - float(stats_dict.get('start') or time.time()), 0.1) if stats_dict.get('start') else 0.0
+    rate = (ck / elapsed) if (elapsed > 0 and ck > 0) else float(cur_r or 0.0)
+    eta_s = int((tot - ck) / rate) if (rate > 0 and tot > ck) else 0
+    vpc = vpnpool_cfg if vpnpool_cfg is not None else _VPNPOOL_CFG
+    is_gw = bool(vpc.get('api_url') and vpc.get('api_lease_id'))
+    prov_name = ''
+    if vpn_coord and vpn_coord.cur_ovpn_cfg:
+        prov_fn = getattr(vpn_coord, 'ovpn_provider_of', None)
+        prov_name = prov_fn(vpn_coord.cur_ovpn_cfg) if callable(prov_fn) else os.path.basename(os.path.dirname(vpn_coord.cur_ovpn_cfg))
+    vpn_info = {
+        'mode': 'ufasproxy' if is_gw else ('ovpn' if (vpn_coord and vpn_coord.ovpn_files) else 'direct'),
+        'proxy_live': len(live_pool or []) if is_gw else 0,
+        'ovpn': os.path.basename(vpn_coord.cur_ovpn_cfg) if (vpn_coord and vpn_coord.cur_ovpn_cfg) else '',
+        'provider': prov_name,
+        'exit_ip': vpn_coord.current_ip if vpn_coord else '',
+        'rotating': bool(vpc.get('rotating')) if is_gw else (bool(vpn_coord.rotating) if vpn_coord else False),
+        'rotations': int(vpn_coord.rotations) if vpn_coord else 0,
+        'consec_waf_rate': int(vpn_coord.consec_waf_rate) if vpn_coord else 0,
+        'waf_threshold': int(vpn_coord.waf_threshold) if vpn_coord else 0,
+        'ovpn_total': len(vpn_coord.ovpn_files) if vpn_coord else 0,
+        'ovpn_penalized': len(vpn_coord.ovpn_penalties) if vpn_coord else 0,
+        'ovpn_cooldown_count': sum(
+            1 for k, t in (vpn_coord.ovpn_cooldown_until.items() if vpn_coord else ())
+            if k.endswith('.ovpn') and t > time.monotonic()
+        ),
+        'node_score': round(float(vpn_coord.node_score(vpn_coord.cur_ovpn_cfg)), 3) if (vpn_coord and vpn_coord.cur_ovpn_cfg and hasattr(vpn_coord, 'node_score')) else 0.0,
+    }
+    return {
+        'ts': time.time(),
+        'stats': {
+            'status': str(stats_dict.get('status') or 'RUNNING'),
+            'checked': ck,
+            'total': tot,
+            'valid': int(stats_dict.get('valid') or 0),
+            'otp': int(stats_dict.get('otp') or 0),
+            'invalid': int(stats_dict.get('invalid') or 0),
+            'error': int(stats_dict.get('error') or 0),
+            'waf': int(stats_dict.get('waf') or 0),
+            'waf_solved': int(stats_dict.get('waf_solved') or 0),
+            'rate_per_sec': round(rate, 2),
+            'cpm': int(round(rate * 60)),
+            'eta_sec': eta_s,
+            'workers_live': int(stats_dict.get('workers') or 0),
+            'workers_total': int(stats_dict.get('workers_total') or 0),
+            'bytes_used': int(stats_dict.get('bytes_used') or 0),
+            'rank_mythic': int(stats_dict.get('rank_mythic') or 0),
+            'rank_legend': int(stats_dict.get('rank_legend') or 0),
+            'rank_epic': int(stats_dict.get('rank_epic') or 0),
+            'rank_other': int(stats_dict.get('rank_other') or 0),
+            'peak_skins': int(stats_dict.get('peak_skins') or 0),
+            'peak_lvl': int(stats_dict.get('peak_lvl') or 0),
+        },
+        'smart': {
+            'health': 'DROP' if is_drop else 'HEALTHY',
+            'is_drop': bool(is_drop),
+            'cause_tag': tag,
+            'cause_desc': desc,
+            'cause_pct': int(pct),
+            'cur_rate': round(float(cur_r), 2),
+            'peak_rate': round(float(peak_r), 2),
+            'session_peak': round(float(perf.session_peak), 2),
+            'target_workers': int(getattr(perf, 'target_workers', 0)),
+            'min_workers': int(getattr(perf, 'min_workers', 1)),
+            'max_workers': int(getattr(perf, 'max_workers', 0)),
+            'live_workers': int(perf.live_workers()) if hasattr(perf, 'live_workers') else int(stats_dict.get('workers') or 0),
+            'smart_note': str(getattr(perf, 'smart_note', '')),
+            'stalls': {k: round(float(v), 2) for k, v in perf.totals.items()},
+            'last_heal': dict(last_heal) if last_heal else None,
+        },
+        'vpn': vpn_info,
+        'top_hits': [_clean_tui(x) for x in list(top_hits or [])[:10]],
+        'log_tail': [_clean_tui(x) for x in list(live_logs or [])[-50:]],
+    }
+
+
+def _write_json_atomic(path: str, data: dict):
+    if not path:
+        return
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
 class VpnCoordinator:
     """Koordinasi VPN shared exit-IP antar worker (cooldown / --vpn-cmd / --vpn-wait / --vpn-ovpn-dir)."""
     def __init__(self, vpn_cmd: str = '', vpn_wait: bool = False, waf_threshold: int = 5,
                  waf_cooldown: float = 25.0, rotate_every: int = 0, ip_check: bool = True,
-                 current_ip: str = 'unknown', ovpn_dir: str = '', ovpn_auth: str = ''):
+                 current_ip: str = 'unknown', ovpn_dir: str = '', ovpn_auth: str = '',
+                 induk_host: str = ''):
         self.vpn_cmd = (vpn_cmd or '').strip()
         self.vpn_wait = bool(vpn_wait)
         self.waf_threshold = max(1, int(waf_threshold))
@@ -2328,8 +2454,11 @@ class VpnCoordinator:
         self.current_ip = current_ip or 'unknown'
         self.ovpn_dir = (ovpn_dir or '').strip()
         self.ovpn_auth = (ovpn_auth or '').strip()
+        self.induk_host = (induk_host or '').strip()
+        self._non_tun_dev_gw = None
         self.ovpn_bin = None
         self.ovpn_files: list[str] = []
+        self.ovpn_auth_map: dict[str, str] = {}
         self.ovpn_idx = 0
         self.cur_ovpn_cfg = ''
         self.ovpn_penalties: dict[str, int] = {}
@@ -2351,23 +2480,54 @@ class VpnCoordinator:
             if not os.path.isdir(d_abs):
                 raise RuntimeError(f"Folder .ovpn tidak ditemukan: {d_abs}")
             self.ovpn_dir = d_abs
-            self.ovpn_files = sorted(
+
+            def _scan_dir_auth(folder_p: str) -> str:
+                for cand in ('auth.txt', '.auth', 'pass.txt', 'credentials.txt'):
+                    cp = os.path.join(folder_p, cand)
+                    if os.path.isfile(cp):
+                        return cp
+                for fn in sorted(os.listdir(folder_p)):
+                    if fn.lower().endswith('.auth') and os.path.isfile(os.path.join(folder_p, fn)):
+                        return os.path.join(folder_p, fn)
+                return ''
+
+            top_ovpns = sorted(
                 os.path.join(d_abs, f) for f in os.listdir(d_abs)
                 if f.lower().endswith('.ovpn') and os.path.isfile(os.path.join(d_abs, f))
             )
+            groups: list[list[str]] = []
+            if top_ovpns:
+                groups.append(top_ovpns)
+            for sub in sorted(os.listdir(d_abs)):
+                sub_p = os.path.join(d_abs, sub)
+                if not os.path.isdir(sub_p):
+                    continue
+                sub_ovpns = sorted(
+                    os.path.join(sub_p, f) for f in os.listdir(sub_p)
+                    if f.lower().endswith('.ovpn') and os.path.isfile(os.path.join(sub_p, f))
+                )
+                if sub_ovpns:
+                    sub_auth = _scan_dir_auth(sub_p)
+                    for ovp in sub_ovpns:
+                        self.ovpn_auth_map[ovp] = sub_auth
+                    groups.append(sub_ovpns)
+            from itertools import zip_longest
+            for row in zip_longest(*groups):
+                for item in row:
+                    if item:
+                        self.ovpn_files.append(item)
             if not self.ovpn_files:
                 raise RuntimeError(f"Tidak ada file *.ovpn di folder: {d_abs}")
             self.ovpn_bin = _find_openvpn_bin()
             if not self.ovpn_bin:
                 raise RuntimeError("Binary openvpn tidak ditemukan. Install OpenVPN dulu.")
             if not self.ovpn_auth:
-                for cand in ('auth.txt', 'pass.txt', 'credentials.txt'):
-                    cp = os.path.join(d_abs, cand)
-                    if os.path.isfile(cp):
-                        self.ovpn_auth = cp
-                        break
+                self.ovpn_auth = _scan_dir_auth(d_abs)
             elif not os.path.isfile(self.ovpn_auth):
                 raise RuntimeError(f"File auth OpenVPN tidak ditemukan: {self.ovpn_auth}")
+            if top_ovpns and self.ovpn_auth:
+                for ovp in top_ovpns:
+                    self.ovpn_auth_map[ovp] = self.ovpn_auth
         self.consec_waf_rate = 0
         self._recent_outcomes: deque[bool] = deque(maxlen=18)
         self.epoch = 0
@@ -2395,14 +2555,13 @@ class VpnCoordinator:
 
     async def _preserve_linux_vps_routes(self):
         """Pasang policy routing (table 100) agar SSH/incoming ke IP asli VPS tetap hidup saat OpenVPN mengubah default route."""
-        if os.name == 'nt' or not sys.platform.startswith('linux') or _PLAT['is_android'] or self._linux_ssh_preserved:
+        if os.name == 'nt' or not sys.platform.startswith('linux') or _PLAT['is_android']:
             return
         if hasattr(os, 'geteuid') and os.geteuid() != 0:
             return
         ip_bin = shutil.which('ip') or ('/sbin/ip' if os.path.isfile('/sbin/ip') else '/usr/sbin/ip')
         if not ip_bin or not os.path.isfile(ip_bin):
             return
-        self._linux_ssh_preserved = True
 
         async def _run_ip(*args: str) -> tuple[int, str]:
             proc = await asyncio.create_subprocess_exec(
@@ -2412,6 +2571,18 @@ class VpnCoordinator:
             out_b, _ = await asyncio.wait_for(proc.communicate(), timeout=4.0)
             return proc.returncode, (out_b or b'').decode('utf-8', errors='ignore')
 
+        if self._linux_ssh_preserved:
+            cached = self._non_tun_dev_gw
+            if self.induk_host and cached:
+                induk_ip = _resolve_host_ipv4(self.induk_host)
+                if induk_ip:
+                    try:
+                        await _run_ip(*_build_induk_bypass_route_cmd(induk_ip, cached[0], cached[1]))
+                    except Exception:
+                        pass
+            return
+        self._linux_ssh_preserved = True
+
         try:
             rc, rt_out = await _run_ip('-4', 'route', 'show', 'default')
             if rc != 0:
@@ -2419,6 +2590,7 @@ class VpnCoordinator:
             dev, gw = self._parse_linux_default_route(rt_out)
             if not dev:
                 return
+            self._non_tun_dev_gw = (dev, gw)
             rc_a, addr_out = await _run_ip('-4', '-o', 'addr', 'show', 'dev', dev, 'scope', 'global')
             if rc_a != 0:
                 return
@@ -2452,6 +2624,11 @@ class VpnCoordinator:
                 rc_r, _ = await _run_ip('rule', 'add', 'from', f'{ip_addr}/32', 'table', '100', 'priority', '100')
                 if rc_r == 0:
                     p_out(f"{c(GRAY)}[*] Policy route VPS/SSH aktif: {ip_addr} -> {dev} (table 100) ✓{W}")
+            if self.induk_host:
+                induk_ip = _resolve_host_ipv4(self.induk_host)
+                if induk_ip:
+                    await _run_ip(*_build_induk_bypass_route_cmd(induk_ip, dev, gw))
+                    p_out(f"{c(GRAY)}[*] Bypass route Induk aktif: {induk_ip}/32 -> {dev} ✓{W}")
         except Exception as exc:
             dbg(f"preserve_linux_vps_routes note: {exc}")
 
@@ -2538,8 +2715,9 @@ class VpnCoordinator:
                 cmd.append('--disable-dco')
             if self.ovpn_ignore_dns_block:
                 cmd.extend(['--pull-filter', 'ignore', 'block-outside-dns'])
-        if self.ovpn_auth:
-            cmd.extend(['--auth-user-pass', os.path.abspath(self.ovpn_auth)])
+        auth_cfg = self.ovpn_auth_map.get(cfg, self.ovpn_auth)
+        if auth_cfg:
+            cmd.extend(['--auth-user-pass', os.path.abspath(auth_cfg)])
         return cmd
 
     @staticmethod
@@ -5485,6 +5663,9 @@ async def async_main():
     pa.add_argument('--license-key', type=str, default='')
     pa.add_argument('--two-tab', action='store_true', default=False)
     pa.add_argument('--ascii', action='store_true', help='Paksa UI pure ASCII (tanpa Unicode box drawing)')
+    pa.add_argument('--status-json', type=str, default='', help='Tulis snapshot progress & Sistem Pintar periodik ke file JSON')
+    pa.add_argument('--induk-host', type=str, default='', help='Hostname/IP VPS Induk untuk bypass route non-tunnel')
+    pa.add_argument('--rotate-trigger', type=str, default='', help='Path file trigger untuk rotasi VPN jarak jauh')
     pa.add_argument('--selftest', action='store_true')
     args = pa.parse_args()
     args.combo = args.combo or args.combo_flag
@@ -6118,6 +6299,7 @@ async def async_main():
             waf_cooldown=waf_cooldown, rotate_every=vpn_rotate_every,
             ip_check=vpn_ip_check, current_ip=vpn_ip_init,
             ovpn_dir=ovpn_dir, ovpn_auth=args.vpn_ovpn_auth,
+            induk_host=args.induk_host,
         )
     except RuntimeError as ve:
         p_out(f"{c(RED)}[!] {ve}{W}")
@@ -6147,7 +6329,33 @@ async def async_main():
         f" {c(WHITE)}Output  :{W} {c(GRAY)}{shortpath(OUTPUT_DIR)}/{W}",
     ], bc=GRAY)
 
+    _status_json_path = (args.status_json or '').strip()
+    _rotate_trig_path = (args.rotate_trigger or '').strip()
+    _last_heal_info: dict | None = None
+    live_pool = None
+    _remote_rotate_flag = [False]
+    if hasattr(signal, 'SIGUSR1'):
+        try:
+            signal.signal(signal.SIGUSR1, lambda _s, _f: _remote_rotate_flag.__setitem__(0, True))
+        except Exception:
+            pass
+
+    def _flush_status_json():
+        if _status_json_path:
+            try:
+                _write_json_atomic(
+                    _status_json_path,
+                    _build_status_snapshot(
+                        stats, _PERF, vpn_coord, _TOP_HITS, _LIVE_LOGS, _last_heal_info,
+                        live_pool=live_pool, vpnpool_cfg=_VPNPOOL_CFG,
+                    ),
+                )
+            except Exception:
+                pass
+
     if not queue:
+        stats['status'] = 'DONE'
+        _flush_status_json()
         p_out(f"{c(GREEN)}[*] Semua akun pada file combo sudah selesai diperiksa.{W}")
         return
 
@@ -6167,6 +6375,7 @@ async def async_main():
     _inst_lock = None
     aborted_on_errors = False
     interrupted = False
+    work_finished = False
     stats['start'] = time.time()
     class _TrackQueue(asyncio.Queue):
         def __init__(self):
@@ -6414,11 +6623,33 @@ async def async_main():
             sys.stdout.write("\033[?1049h\033[?25l\033[2J\033[H")
             sys.stdout.flush()
             render_dashboard(force=True)
+        _flush_status_json()
+
         async def _tui_heartbeat():
+            nonlocal _last_heal_info
             while True:
                 await asyncio.sleep(2.0)
                 if _TUI_ACTIVE:
                     render_dashboard(force=True)
+                if _rotate_trig_path and os.path.exists(_rotate_trig_path):
+                    try:
+                        os.remove(_rotate_trig_path)
+                    except OSError:
+                        pass
+                    _remote_rotate_flag[0] = True
+                if _remote_rotate_flag[0]:
+                    if vpn_coord is not None and not vpn_coord.rotating:
+                        _remote_rotate_flag[0] = False
+                        if len(vpn_coord.ovpn_files) > 1 or vpn_coord.vpn_cmd:
+                            try:
+                                await vpn_coord.coordinate("remote:rotate", vpn_coord.epoch, browser_state, stats)
+                            except RuntimeError:
+                                pass
+                    elif vpn_coord is None and (_VPNPOOL_CFG.get('api_lease_id') or _VPNPOOL_CFG.get('started')) and live_pool:
+                        _remote_rotate_flag[0] = False
+                        for _px in list(live_pool):
+                            _maybe_rotate_vpnpool_slot(_px)
+                _flush_status_json()
                 if stats.get('status') != 'RUNNING' or combo_q.pending <= 0:
                     continue
                 if vpn_coord is not None and (vpn_coord.ovpn_failed or vpn_coord.rotating):
@@ -6438,6 +6669,7 @@ async def async_main():
                     why = info.get('reason', f"{info.get('cur_r', 0.0):.1f}/s")
                     tag_n = f"{new_w}/{_PERF.max_workers}w +"
                     await _PERF.set_target_workers(new_w, tag_n)
+                    _last_heal_info = {'cause': act, 'action': f"{old_w}->{new_w}w ({why})", 'cur': round(float(info.get('cur_r', 0.0)), 2), 'peak': round(float(_PERF.session_peak), 2), 'at': time.time()}
                     msg = f"SMART {old_w}->{new_w}w ({why})"
                     _LIVE_LOGS.append(f" {c(CYAN)}*{W}  {c(CYAN)}{msg[:54]}{W}")
                     if not _TUI_ACTIVE:
@@ -6447,6 +6679,7 @@ async def async_main():
                     _PERF.drop_since_t = 0.0
                     _PERF.pause_until_t = time.monotonic() + 28.0
                     h_cur, h_peak = info.get('cur_r', 0.0), info.get('peak_r', 0.0)
+                    _last_heal_info = {'cause': info.get('reason', 'LOCK'), 'action': 'recycle_browser', 'cur': round(h_cur, 2), 'peak': round(h_peak, 2), 'at': time.time()}
                     _LIVE_LOGS.append(f" {c(GOLD)}!{W}  {c(GOLD)}SMART HEAL: recycle browser ({h_cur:.2f} vs {h_peak:.2f}/s){W}")
                     if not _TUI_ACTIVE:
                         p_out(f"  {c(GOLD)}[SMART] {info.get('reason', 'LOCK')} -> recycle Chromium...{W}")
@@ -6455,6 +6688,7 @@ async def async_main():
                     _PERF.last_heal_t = time.monotonic()
                     _PERF.drop_since_t = 0.0
                     h_tag = info.get('tag', 'SLOW')
+                    _last_heal_info = {'cause': h_tag, 'action': 'rotate_vpn', 'cur': round(float(info.get('cur_r', 0.0)), 2), 'peak': round(float(_PERF.session_peak), 2), 'at': time.time()}
                     _LIVE_LOGS.append(f" {c(GOLD)}!{W}  {c(GOLD)}SMART VPN: {info.get('reason', h_tag)} -> rotasi VPN{W}")
                     if not _TUI_ACTIVE:
                         p_out(f"  {c(GOLD)}[SMART] {info.get('reason', h_tag)} -> rotasi VPN...{W}")
@@ -6548,6 +6782,7 @@ async def async_main():
                     aborted_on_errors = True
                     break
                 if combo_q.pending <= 0:
+                    work_finished = True
                     break
                 if stats['checked'] == checked_before or stats['checked'] < wave_limit:
                     aborted_on_errors = True
@@ -6612,8 +6847,9 @@ async def async_main():
                 pass
         if _CACHE_DIRTY:
             _save_static_cache()
+        stats['status'] = 'ABORTED' if (aborted_on_errors or (not interrupted and not work_finished)) else 'DONE'
+        _flush_status_json()
         if _TUI_ACTIVE:
-            stats['status'] = 'DONE'
             render_dashboard(force=True)
             _TUI_ACTIVE = False
             sys.stdout.write("\033[?1049l\033[?25h\n")

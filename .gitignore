@@ -13,6 +13,12 @@ token.env
 .ufasproxy_state.json*
 .tg_status_state.json*
 *.log
+induk_data/
+.venv_induk/
+.agent_state/
+vpns_assigned*/
+vpns_staging/
+.pytest_cache/
 output/
 input/proxies.txt
 combo.txt

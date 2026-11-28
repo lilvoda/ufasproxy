@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ufasproxy Induk Controller</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="dot" id="ws-dot"></span>
+      <strong>ufasproxy Induk</strong>
+      <span class="muted" id="ws-label">Disconnected</span>
+    </div>
+    <div class="auth-bar">
+      <input type="password" id="api-key-input" placeholder="X-API-Key" />
+      <button id="connect-btn">Connect</button>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="kpis" id="kpi-strip">
+      <div class="kpi"><span class="k-lbl">PROCESSED</span><strong id="k-proc">0 / 0</strong></div>
+      <div class="kpi"><span class="k-lbl">VALID</span><strong class="ok" id="k-valid">0</strong></div>
+      <div class="kpi"><span class="k-lbl">2FA / OTP</span><strong class="warn" id="k-otp">0</strong></div>
+      <div class="kpi"><span class="k-lbl">SPEED</span><strong id="k-rate">0.0/s</strong></div>
+      <div class="kpi"><span class="k-lbl">WAF</span><strong id="k-waf">0/0</strong></div>
+      <div class="kpi"><span class="k-lbl">ACTIVE VPS</span><strong id="k-vps">0 / 0</strong></div>
+      <div class="kpi"><span class="k-lbl">WORKERS</span><strong id="k-wrk">0 / 0</strong></div>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>List Progress VPS</h2>
+        <div class="bulk-bar">
+          <button onclick="bulkCmd('STOP')">Stop Checked</button>
+          <button onclick="bulkCmd('RESTART')">Restart Checked</button>
+          <button onclick="bulkCmd('ROTATE_VPN')">Rotate VPN</button>
+          <button onclick="distributeVpn()">Split &amp; Sync VPN</button>
+          <button onclick="bulkCmd('BENCHMARK')">Re-Benchmark</button>
+          <button onclick="bulkCmd('UPDATE_CODE')">Git Pull</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th><input type="checkbox" id="chk-all" /></th>
+              <th>VPS</th>
+              <th>Status</th>
+              <th>Progress</th>
+              <th>Speed / ETA</th>
+              <th>Valid / 2FA</th>
+              <th>WAF</th>
+              <th>Workers</th>
+              <th>VPN / Gateway</th>
+              <th>Sistem Pintar</th>
+              <th>Aksi</th>
+            </tr>
+          </thead>
+          <tbody id="vps-tbody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="grid-2">
+      <div class="card">
+        <div class="card-head">
+          <h2>Sistem Pintar &amp; Live Monitor</h2>
+          <select id="inspect-vps-select"></select>
+        </div>
+        <div id="smart-panel" class="smart-panel muted">Pilih VPS untuk lihat detail Sistem Pintar.</div>
+        <pre id="live-logs" class="log-box"></pre>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h2>Send Input &amp; Jalankan</h2>
+          <div class="tabs">
+            <button class="tab active" data-mode="split" id="mode-split-btn">Split Otomatis</button>
+            <button class="tab" data-mode="per_vps" id="mode-11-btn">Per-VPS (1-1)</button>
+          </div>
+        </div>
+        <div id="split-box">
+          <div class="row">
+            <label>Strategi Split:
+              <select id="split-strategy">
+                <option value="weighted">Berbobot (sesuai Benchmark Workers)</option>
+                <option value="even">Rata Sama Besar</option>
+              </select>
+            </label>
+            <label>Upload .txt: <input type="file" id="combo-file" accept=".txt" /></label>
+          </div>
+          <textarea id="combo-text" rows="5" placeholder="Paste combo user:pass per baris..."></textarea>
+        </div>
+        <div id="per-vps-box" class="hidden"></div>
+        <div class="row">
+          <label>Workers (0 = Auto Bench): <input type="number" id="run-workers" value="0" min="0" max="30" /></label>
+          <label>WAF Threshold: <input type="number" id="run-waf" value="3" min="1" max="50" /></label>
+          <label>Cooldown (s): <input type="number" id="run-cd" value="25" min="3" max="300" /></label>
+        </div>
+        <div class="row">
+          <input type="text" id="run-vpn-api-url" placeholder="Gateway URL (kosong = token.env worker)" />
+          <label><input type="checkbox" id="run-two-tab" /> 2-Tab</label>
+          <label><input type="checkbox" id="run-skip-ovpn" /> Skip OVPN Test</label>
+          <label><input type="checkbox" id="run-dist-vpn" /> Auto Split Folder .ovpn Lokal</label>
+        </div>
+        <div id="vpn-pool-info" class="muted"></div>
+        <button class="primary" id="dispatch-btn">Jalankan di VPS Tercentang</button>
+      </div>
+    </section>
+
+    <section class="grid-2">
+      <div class="card">
+        <div class="card-head">
+          <h2>Setup VPS Baru (Multi-Distro Linux + Auto Benchmark)</h2>
+          <select id="prov-mode">
+            <option value="ssh">Auto-SSH Install</option>
+            <option value="bootstrap">One-Line Bootstrap</option>
+          </select>
+        </div>
+        <div class="row">
+          <input type="text" id="prov-id" placeholder="VPS ID (mis. vps-4)" />
+          <input type="text" id="prov-name" placeholder="Nama Label" />
+        </div>
+        <div id="ssh-fields">
+          <div class="row">
+            <input type="text" id="prov-host" placeholder="IP / Host VPS" />
+            <input type="number" id="prov-port" value="22" placeholder="Port" />
+            <input type="text" id="prov-user" value="root" placeholder="User" />
+          </div>
+          <div class="row">
+            <input type="password" id="prov-pass" placeholder="SSH Password (opsional jika pakai key)" />
+          </div>
+          <textarea id="prov-key" rows="2" placeholder="SSH Private Key (opsional)"></textarea>
+        </div>
+        <div class="row">
+          <input type="text" id="prov-induk-url" placeholder="INDUK_URL (kosong = URL saat ini)" />
+          <input type="text" id="prov-ptr-url" placeholder="INDUK_POINTER_URL (opsional)" />
+        </div>
+        <button class="primary" id="prov-btn">Setup &amp; Benchmark VPS</button>
+        <pre id="prov-log" class="log-box"></pre>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>Hasil Hits &amp; Migrasi Induk</h2></div>
+        <div class="row">
+          <input type="text" id="res-job-id" value="all" placeholder="Job ID atau 'all'" />
+          <select id="res-type"><option value="VALID">VALID</option><option value="OTP">2FA / OTP</option></select>
+          <select id="res-dedup"><option value="per_job">Dedup Per-Job</option><option value="global">Dedup Global</option></select>
+          <button id="download-hits-btn">Download .txt</button>
+        </div>
+        <hr />
+        <div class="row">
+          <button id="backup-btn">1-Klik Download Backup (.tar.gz)</button>
+          <input type="file" id="restore-file" accept=".tar.gz" />
+          <button id="restore-btn">Restore Backup</button>
+        </div>
+        <div class="row">
+          <input type="text" id="new-induk-url" placeholder="URL Induk Baru (http://IP:8000)" />
+          <button id="migrate-btn">Push SET_INDUK ke Semua/Tercentang</button>
+        </div>
+        <div id="sys-msg" class="muted"></div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

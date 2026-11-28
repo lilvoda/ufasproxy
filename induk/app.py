@@ -1,0 +1,754 @@
+"""FastAPI Induk server: REST API, rate-limited auth, and 2-way WebSocket hub."""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import hmac
+import os
+import re
+import secrets
+import time
+from collections import defaultdict, deque
+from contextlib import asynccontextmanager
+
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, PlainTextResponse, Response
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+from induk.backup import export_induk_bundle, restore_induk_bundle
+from induk.combo_split import assign_per_vps, clean_combos, split_combos
+from induk.db import IndukDB
+from induk.provisioner import UnsupportedOSError, provision_via_ssh, render_bootstrap_script
+from induk.vpn_pool import build_vpn_tarball, interleave_and_shard, scan_vpn_folders
+
+
+class _RateLimiter:
+    """Bounded in-memory sliding-window auth failure limiter (max 10 failures / 60s per IP)."""
+
+    def __init__(self, max_fails: int = 10, window_s: float = 60.0, max_ips: int = 2048) -> None:
+        self.max_fails = max_fails
+        self.window_s = window_s
+        self.max_ips = max_ips
+        self._fails: dict[str, deque[float]] = defaultdict(deque)
+
+    def _prune(self, ip: str, now: float) -> deque[float]:
+        q = self._fails[ip]
+        cut = now - self.window_s
+        while q and q[0] < cut:
+            q.popleft()
+        return q
+
+    def check(self, ip: str) -> None:
+        now = time.monotonic()
+        if ip in self._fails and len(self._prune(ip, now)) >= self.max_fails:
+            raise HTTPException(status_code=429, detail="Too many failed auth attempts")
+
+    def record_fail(self, ip: str) -> None:
+        now = time.monotonic()
+        if len(self._fails) >= self.max_ips and ip not in self._fails:
+            cut = now - self.window_s
+            stale = [k for k, q in self._fails.items() if not q or q[-1] < cut]
+            for k in stale[: self.max_ips // 2]:
+                self._fails.pop(k, None)
+            if len(self._fails) >= self.max_ips:
+                self._fails.pop(next(iter(self._fails)), None)
+        self._prune(ip, now).append(now)
+
+    def reset(self, ip: str) -> None:
+        self._fails.pop(ip, None)
+
+
+class Hub:
+    """Manages active 2-way WebSocket connections for worker agents and browser UI clients."""
+
+    def __init__(self) -> None:
+        self.agent_sockets: dict[str, WebSocket] = {}
+        self.ui_sockets: set[WebSocket] = set()
+
+    async def push_to_agent(self, vps_id: str, message: dict) -> bool:
+        ws = self.agent_sockets.get(vps_id)
+        if ws is None:
+            return False
+        try:
+            await ws.send_json(message)
+            return True
+        except Exception:
+            if self.agent_sockets.get(vps_id) is ws:
+                self.agent_sockets.pop(vps_id, None)
+            return False
+
+    async def broadcast_ui(self, event: dict) -> None:
+        dead: list[WebSocket] = []
+        for ws in list(self.ui_sockets):
+            try:
+                await ws.send_json(event)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.ui_sockets.discard(ws)
+
+    async def close_all(self) -> None:
+        for ws in list(self.agent_sockets.values()) + list(self.ui_sockets):
+            try:
+                await ws.close(code=1001)
+            except Exception:
+                pass
+        self.agent_sockets.clear()
+        self.ui_sockets.clear()
+
+
+_VPS_ID_PAT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_VPS_ID_RE = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+_ALLOWED_COMMANDS = {"START", "STOP", "RESTART", "ROTATE_VPN", "SYNC_VPN", "UPDATE_CODE", "BENCHMARK", "SET_INDUK"}
+
+
+def _validate_safe_id(val: str, label: str = "id") -> str:
+    s = (val or "").strip()
+    if not _VPS_ID_PAT.match(s) or ".." in s:
+        raise HTTPException(status_code=422, detail=f"Invalid {label}: {val!r}")
+    return s
+
+
+class RegisterNodeBody(BaseModel):
+    vps_id: str = Field(min_length=1, max_length=64, pattern=_VPS_ID_RE)
+    name: str = ""
+    default_workers: int = Field(default=4, ge=1, le=30)
+    os_info: str = ""
+
+
+class BulkCommandBody(BaseModel):
+    vps_ids: list[str]
+    type: str
+    payload: dict = Field(default_factory=dict)
+
+
+class HitsBatchBody(BaseModel):
+    job_id: str
+    hit_type: str = "VALID"
+    lines: list[str] = Field(default_factory=list)
+
+
+class VpnDistributeBody(BaseModel):
+    vps_ids: list[str]
+    folders: list[str] = Field(default_factory=list)
+    sync_now: bool = True
+
+
+class JobDispatchBody(BaseModel):
+    vps_ids: list[str]
+    mode: str = "split"  # "split" | "per_vps"
+    split_strategy: str = "weighted"  # "even" | "weighted"
+    combo_text: str = ""
+    per_vps_combos: dict[str, str] = Field(default_factory=dict)
+    args: list[str] = Field(default_factory=list)
+    workers: int = 0  # 0 = auto per-VPS benchmarked default_workers
+    distribute_vpn: bool = False
+    vpn_folders: list[str] = Field(default_factory=list)
+
+
+class ProvisionBody(BaseModel):
+    vps_id: str = Field(min_length=1, max_length=64, pattern=_VPS_ID_RE)
+    name: str = ""
+    mode: str = "ssh"  # "ssh" | "bootstrap"
+    host: str = ""
+    port: int = Field(default=22, ge=1, le=65535)
+    username: str = "root"
+    password: str = ""
+    private_key: str = ""
+    induk_url: str = ""
+    repo_url: str = "https://github.com/lilvoda/ufasproxy.git"
+    pointer_url: str = ""
+    ufasproxy_url: str = ""
+    ufasproxy_token: str = ""
+
+
+_BOOL_CHECKER_FLAGS = {
+    "--two-tab",
+    "--skip-ovpn-test",
+    "--retest-ovpn",
+    "--no-vpn-ip-check",
+    "--no-proxy",
+    "--headless",
+    "--no-headless",
+    "--debug",
+    "--ascii",
+}
+_VAL_CHECKER_FLAGS = {
+    "--workers",
+    "--vpn-api-url",
+    "--vpn-waf-threshold",
+    "--waf-cooldown",
+    "--vpn-rotate-every",
+}
+
+
+def _validate_flag_value(flag: str, val: str) -> None:
+    if not val or val.startswith("-"):
+        raise HTTPException(status_code=400, detail=f"{flag} requires a non-flag value")
+    if flag == "--vpn-api-url":
+        if not val.startswith(("http://", "https://")):
+            raise HTTPException(status_code=400, detail="--vpn-api-url must start with http:// or https://")
+    elif flag == "--workers":
+        if val != "auto":
+            try:
+                w = int(val)
+                if not (1 <= w <= 30):
+                    raise ValueError
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail="--workers must be 1..30 or auto") from exc
+    elif flag in ("--vpn-waf-threshold", "--vpn-rotate-every"):
+        try:
+            n = int(val)
+            if n < 0 or n > 10000:
+                raise ValueError
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"{flag} must be a valid integer") from exc
+    elif flag == "--waf-cooldown":
+        try:
+            f = float(val)
+            if not (1.0 <= f <= 600.0):
+                raise ValueError
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="--waf-cooldown must be 1..600") from exc
+
+
+def _validate_checker_args(raw_args: list[str]) -> list[str]:
+    clean: list[str] = []
+    pending_flag = ""
+    for tok in raw_args:
+        s = str(tok).strip()
+        if not s:
+            continue
+        if pending_flag:
+            _validate_flag_value(pending_flag, s)
+            clean.append(s)
+            pending_flag = ""
+            continue
+        if not s.startswith("-"):
+            raise HTTPException(status_code=400, detail=f"Unexpected positional arg: {s}")
+        flag, has_eq, val = s.partition("=")
+        if flag in _BOOL_CHECKER_FLAGS:
+            if has_eq:
+                raise HTTPException(status_code=400, detail=f"{flag} does not take a value")
+            clean.append(flag)
+        elif flag in _VAL_CHECKER_FLAGS:
+            if has_eq:
+                _validate_flag_value(flag, val)
+                clean.append(s)
+            else:
+                clean.append(flag)
+                pending_flag = flag
+        else:
+            raise HTTPException(status_code=400, detail=f"Disallowed checker flag: {flag}")
+    if pending_flag:
+        raise HTTPException(status_code=400, detail=f"{pending_flag} requires a value")
+    return clean
+
+
+class MigrateIndukBody(BaseModel):
+    new_induk_url: str
+    vps_ids: list[str] = Field(default_factory=list)
+
+
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+def _bearer_token(auth_header: str | None) -> str:
+    if not auth_header:
+        return ""
+    parts = auth_header.split(None, 1)
+    if len(parts) == 2 and parts[0].lower() == "bearer":
+        return parts[1].strip()
+    return ""
+
+
+def create_app(
+    db_path: str | None = None,
+    api_key: str | None = None,
+    data_dir: str | None = None,
+    repo_dir: str | None = None,
+) -> FastAPI:
+    base_data = os.path.abspath(data_dir or os.environ.get("INDUK_DATA_DIR", "induk_data"))
+    resolved_db = db_path or os.environ.get("INDUK_DB_PATH") or os.path.join(base_data, "induk.db")
+    resolved_repo = os.path.abspath(repo_dir or os.environ.get("INDUK_REPO_DIR", os.getcwd()))
+    resolved_key = api_key or os.environ.get("INDUK_API_KEY") or secrets.token_urlsafe(24)
+    offline_s = float(os.environ.get("INDUK_OFFLINE_S", "20.0"))
+    stall_s = float(os.environ.get("INDUK_STALL_S", "180.0"))
+
+    db = IndukDB(resolved_db)
+    hub = Hub()
+    limiter = _RateLimiter()
+    agent_limiter = _RateLimiter()
+    ws_tickets: dict[str, float] = {}
+    ssh_tasks: set[asyncio.Task[None]] = set()
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        os.makedirs(base_data, exist_ok=True)
+        await db.init()
+        try:
+            yield
+        finally:
+            for t in list(ssh_tasks):
+                t.cancel()
+            if ssh_tasks:
+                await asyncio.gather(*ssh_tasks, return_exceptions=True)
+            await hub.close_all()
+            await db.close()
+
+    app = FastAPI(title="ufasproxy Induk Controller", lifespan=lifespan)
+    app.state.db = db
+    app.state.hub = hub
+    app.state.data_dir = base_data
+    app.state.repo_dir = resolved_repo
+    app.state.api_key = resolved_key
+
+    async def require_ui_auth(
+        request: Request,
+        x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    ) -> None:
+        ip = _client_ip(request)
+        limiter.check(ip)
+        if not x_api_key or not hmac.compare_digest(x_api_key, resolved_key):
+            limiter.record_fail(ip)
+            raise HTTPException(status_code=401, detail="Invalid API key")
+        limiter.reset(ip)
+
+    async def require_agent_auth(
+        request: Request,
+        authorization: str | None = Header(default=None, alias="Authorization"),
+    ) -> str:
+        ip = _client_ip(request)
+        agent_limiter.check(ip)
+        tok = _bearer_token(authorization)
+        vps_id = await db.verify_agent_token(tok)
+        if not vps_id:
+            agent_limiter.record_fail(ip)
+            raise HTTPException(status_code=401, detail="Invalid agent token")
+        agent_limiter.reset(ip)
+        return vps_id
+
+    app.state.require_ui_auth = require_ui_auth
+    app.state.require_agent_auth = require_agent_auth
+
+    async def _push_command_to_node(vps_id: str, cmd_type: str, payload: dict) -> dict:
+        cmd = await db.enqueue_command(vps_id, cmd_type, payload)
+        if await hub.push_to_agent(vps_id, {"type": "command", "command": cmd}):
+            await db.mark_delivered([cmd["cmd_id"]])
+        return cmd
+
+    app.state.push_command_to_node = _push_command_to_node
+
+    @app.get("/api/v1/health")
+    async def health():
+        wal = await db.wal_mode()
+        return {"ok": True, "db": wal.lower(), "agents_online": len(hub.agent_sockets)}
+
+    @app.post("/api/v1/ui/ws-ticket", dependencies=[Depends(require_ui_auth)])
+    async def issue_ws_ticket():
+        now = time.monotonic()
+        expired = [k for k, exp in ws_tickets.items() if exp <= now]
+        for k in expired:
+            ws_tickets.pop(k, None)
+        ticket = secrets.token_urlsafe(24)
+        ws_tickets[ticket] = now + 30.0
+        return {"ticket": ticket}
+
+    @app.get("/api/v1/vps", dependencies=[Depends(require_ui_auth)])
+    async def list_vps():
+        nodes, summary = await db.list_nodes(offline_after_s=offline_s, stall_after_s=stall_s)
+        return {"nodes": nodes, "summary": summary}
+
+    @app.post("/api/v1/vps", status_code=201, dependencies=[Depends(require_ui_auth)])
+    async def register_vps(body: RegisterNodeBody):
+        vid = _validate_safe_id(body.vps_id, "vps_id")
+        raw_token = secrets.token_urlsafe(32)
+        node = await db.register_node(
+            vid, body.name.strip() or vid, body.default_workers, raw_token, os_info=body.os_info
+        )
+        return {**node, "agent_token": raw_token}
+
+    @app.post("/api/v1/vps/{vps_id}/rotate-token", dependencies=[Depends(require_ui_auth)])
+    async def rotate_token(vps_id: str):
+        vid = _validate_safe_id(vps_id, "vps_id")
+        raw_token = secrets.token_urlsafe(32)
+        if not await db.rotate_node_token(vid, raw_token):
+            raise HTTPException(status_code=404, detail="VPS not found")
+        old_ws = hub.agent_sockets.pop(vid, None)
+        if old_ws is not None:
+            with contextlib.suppress(Exception):
+                await old_ws.close(code=4001)
+        return {"vps_id": vid, "agent_token": raw_token}
+
+    @app.delete("/api/v1/vps/{vps_id}", dependencies=[Depends(require_ui_auth)])
+    async def remove_vps(vps_id: str):
+        vid = _validate_safe_id(vps_id, "vps_id")
+        old_ws = hub.agent_sockets.pop(vid, None)
+        if old_ws is not None:
+            with contextlib.suppress(Exception):
+                await old_ws.close(code=4001)
+        if not await db.delete_node(vid):
+            raise HTTPException(status_code=404, detail="VPS not found")
+        return {"deleted": vid}
+
+    @app.post("/api/v1/commands/bulk", dependencies=[Depends(require_ui_auth)])
+    async def bulk_commands(body: BulkCommandBody):
+        ctype = body.type.strip().upper()
+        if ctype not in _ALLOWED_COMMANDS:
+            raise HTTPException(status_code=400, detail=f"Unknown command type: {ctype}")
+        nodes, _ = await db.list_nodes(offline_after_s=offline_s, stall_after_s=stall_s)
+        known = {n["vps_id"] for n in nodes}
+        unknown = [vid for vid in body.vps_ids if vid not in known]
+        if unknown:
+            raise HTTPException(status_code=404, detail=f"Unknown VPS IDs: {', '.join(unknown)}")
+        queued = [await _push_command_to_node(vid, ctype, body.payload) for vid in body.vps_ids]
+        return {"ok": True, "queued": queued}
+
+    @app.get("/api/v1/results/{job_id}", dependencies=[Depends(require_ui_auth)])
+    async def get_results(
+        job_id: str,
+        hit_type: str = Query(default="VALID"),
+        dedup: str = Query(default="per_job"),
+        format: str = Query(default="json"),
+    ):
+        target_job = None if job_id == "all" else _validate_safe_id(job_id, "job_id")
+        rows = await db.export_hits(target_job, hit_type=hit_type, dedup=dedup)
+        if format == "txt":
+            body = "\n".join(r["raw_line"] for r in rows) + ("\n" if rows else "")
+            return PlainTextResponse(body, media_type="text/plain; charset=utf-8")
+        return {"job_id": job_id, "hit_type": hit_type.upper(), "dedup": dedup, "count": len(rows), "hits": rows}
+
+    @app.get("/api/v1/agent/pending-commands")
+    async def pending_commands(vps_id: str = Depends(require_agent_auth)):
+        cmds = await db.get_unacked_commands(vps_id)
+        await db.mark_delivered([c["cmd_id"] for c in cmds])
+        await db.touch_seen(vps_id)
+        return {"commands": cmds}
+
+    @app.post("/api/v1/agent/hits")
+    async def upload_hits(body: HitsBatchBody, vps_id: str = Depends(require_agent_auth)):
+        jid = _validate_safe_id(body.job_id, "job_id")
+        inserted, received = await db.insert_hits(jid, vps_id, body.hit_type, body.lines)
+        await db.touch_seen(vps_id)
+        if inserted > 0:
+            await hub.broadcast_ui({"type": "hits_added", "job_id": jid, "vps_id": vps_id, "hit_type": body.hit_type, "inserted": inserted})
+        return {"ok": True, "inserted": inserted, "received": received}
+
+    @app.get("/api/v1/vpn/pool", dependencies=[Depends(require_ui_auth)])
+    async def get_vpn_pool():
+        pool = scan_vpn_folders(resolved_repo)
+        return {
+            "folders": {k: {"count": len(v["ovpns"]), "has_auth": bool(v["auth"])} for k, v in pool.items()},
+            "total": sum(len(v["ovpns"]) for v in pool.values()),
+        }
+
+    async def _distribute_vpn_shards(vps_ids: list[str], folders: list[str] | None, sync_now: bool) -> dict:
+        nodes, _ = await db.list_nodes(offline_after_s=offline_s, stall_after_s=stall_s)
+        by_id = {n["vps_id"]: n for n in nodes}
+        unknown = [vid for vid in vps_ids if vid not in by_id]
+        if unknown:
+            raise HTTPException(status_code=404, detail=f"Unknown VPS IDs: {', '.join(unknown)}")
+        busy = [
+            vid for vid in vps_ids
+            if by_id.get(vid, {}).get("effective_state") in ("RUNNING", "STARTING", "ROTATING")
+        ]
+        if busy:
+            raise HTTPException(
+                status_code=409,
+                detail={"message": "Cannot distribute VPN to running nodes", "busy_nodes": busy},
+            )
+        try:
+            pool = scan_vpn_folders(resolved_repo, folders or None)
+        except ValueError as ve:
+            raise HTTPException(status_code=400, detail=str(ve))
+        if not pool:
+            raise HTTPException(status_code=400, detail="No .ovpn folders found")
+        shards = interleave_and_shard(pool, vps_ids)
+        vpn_dir = os.path.join(base_data, "vpn_pool")
+        os.makedirs(vpn_dir, exist_ok=True)
+        counts: dict[str, int] = {}
+        for vid, entries in shards.items():
+            bundle = await asyncio.to_thread(build_vpn_tarball, entries)
+            with open(os.path.join(vpn_dir, f"{vid}.tar.gz"), "wb") as f:
+                f.write(bundle)
+            counts[vid] = len(entries)
+            if sync_now:
+                await _push_command_to_node(vid, "SYNC_VPN", {})
+        return {"ok": True, "distributed": counts}
+
+    @app.post("/api/v1/vpn/distribute", dependencies=[Depends(require_ui_auth)])
+    async def distribute_vpn(body: VpnDistributeBody):
+        return await _distribute_vpn_shards(body.vps_ids, body.folders, body.sync_now)
+
+    @app.get("/api/v1/agent/vpn-bundle/{target_vps_id}")
+    async def download_vpn_bundle(target_vps_id: str, vps_id: str = Depends(require_agent_auth)):
+        if target_vps_id != vps_id:
+            raise HTTPException(status_code=403, detail="Forbidden")
+        fp = os.path.join(base_data, "vpn_pool", f"{vps_id}.tar.gz")
+        if not os.path.isfile(fp):
+            raise HTTPException(status_code=404, detail="VPN bundle not prepared for this VPS")
+        return FileResponse(fp, media_type="application/gzip")
+
+    @app.post("/api/v1/jobs/dispatch", dependencies=[Depends(require_ui_auth)])
+    async def dispatch_job(body: JobDispatchBody):
+        if not body.vps_ids:
+            raise HTTPException(status_code=400, detail="No VPS selected")
+        validated_args = _validate_checker_args(body.args)
+        nodes, _ = await db.list_nodes(offline_after_s=offline_s, stall_after_s=stall_s)
+        by_id = {n["vps_id"]: n for n in nodes}
+        unknown = [vid for vid in body.vps_ids if vid not in by_id]
+        if unknown:
+            raise HTTPException(status_code=404, detail=f"Unknown VPS IDs: {', '.join(unknown)}")
+
+        if body.mode == "per_vps":
+            assignments = assign_per_vps({vid: body.per_vps_combos.get(vid, "") for vid in body.vps_ids})
+            if not any(assignments.get(vid) for vid in body.vps_ids):
+                raise HTTPException(status_code=400, detail="Per-VPS combo inputs are empty")
+        else:
+            lines = clean_combos(body.combo_text)
+            if not lines:
+                raise HTTPException(status_code=400, detail="Combo list is empty")
+            weights = {
+                vid: (1 if body.split_strategy == "even" else int((by_id.get(vid) or {}).get("default_workers") or 4))
+                for vid in body.vps_ids
+            }
+            assignments = split_combos(lines, weights)
+
+        if body.distribute_vpn:
+            await _distribute_vpn_shards(body.vps_ids, body.vpn_folders, sync_now=False)
+
+        job_id = f"job_{int(time.time())}_{secrets.token_hex(3)}"
+        await db.create_job(job_id, body.mode, {"vps_ids": body.vps_ids, "args": validated_args, "workers": body.workers})
+        job_dir = os.path.join(base_data, "jobs", job_id)
+        os.makedirs(job_dir, exist_ok=True)
+        queued = []
+        has_w_arg = any(a in ("--workers", "-w") or a.startswith(("--workers=", "-w=")) for a in validated_args)
+        for vid in body.vps_ids:
+            chunk = assignments.get(vid) or []
+            if not chunk:
+                continue
+            with open(os.path.join(job_dir, f"{vid}.txt"), "w", encoding="utf-8") as f:
+                f.write("\n".join(chunk) + "\n")
+            args_list = list(validated_args)
+            if not has_w_arg:
+                args_list.extend(["--workers", str(body.workers) if body.workers > 0 else "auto"])
+            cmd = await _push_command_to_node(
+                vid,
+                "START",
+                {
+                    "job_id": job_id,
+                    "combo_url": f"/api/v1/agent/combo/{job_id}/{vid}",
+                    "sync_vpn": bool(body.distribute_vpn),
+                    "args": args_list,
+                },
+            )
+            queued.append(cmd)
+        return {"ok": True, "job_id": job_id, "queued": queued}
+
+    @app.get("/api/v1/agent/combo/{job_id}/{target_vps_id}")
+    async def download_combo(job_id: str, target_vps_id: str, vps_id: str = Depends(require_agent_auth)):
+        jid = _validate_safe_id(job_id, "job_id")
+        if target_vps_id != vps_id:
+            raise HTTPException(status_code=403, detail="Forbidden")
+        fp = os.path.join(base_data, "jobs", jid, f"{vps_id}.txt")
+        if not os.path.isfile(fp):
+            raise HTTPException(status_code=404, detail="Combo chunk not found")
+        return FileResponse(fp, media_type="text/plain; charset=utf-8")
+
+    @app.post("/api/v1/vps/provision", dependencies=[Depends(require_ui_auth)])
+    async def provision_vps(body: ProvisionBody, request: Request):
+        vid = _validate_safe_id(body.vps_id, "vps_id")
+        if body.mode != "bootstrap" and not body.host.strip():
+            raise HTTPException(status_code=400, detail="Host/IP required for SSH provisioning")
+        raw_token = secrets.token_urlsafe(32)
+        induk_url = (body.induk_url or str(request.base_url)).rstrip("/")
+        if body.mode == "bootstrap":
+            await db.register_node(vid, body.name.strip() or vid, 4, raw_token)
+            script = render_bootstrap_script(
+                induk_url, vid, raw_token, body.repo_url, body.pointer_url, body.ufasproxy_url, body.ufasproxy_token
+            )
+            return {"ok": True, "vps_id": vid, "agent_token": raw_token, "bootstrap_script": script}
+
+        async def _run_ssh_task() -> None:
+            async def _emit(line: str) -> None:
+                await hub.broadcast_ui({"type": "provision_log", "vps_id": vid, "line": line})
+
+            try:
+                res = await provision_via_ssh(
+                    host=body.host.strip(),
+                    port=body.port,
+                    username=body.username.strip() or "root",
+                    password=body.password or None,
+                    private_key=body.private_key or None,
+                    vps_id=vid,
+                    token=raw_token,
+                    induk_url=induk_url,
+                    repo_url=body.repo_url,
+                    pointer_url=body.pointer_url,
+                    ufasproxy_url=body.ufasproxy_url,
+                    ufasproxy_token=body.ufasproxy_token,
+                    on_log=_emit,
+                )
+                await db.register_node(
+                    vid,
+                    body.name.strip() or vid,
+                    res["benchmark"]["recommended_workers"],
+                    raw_token,
+                    os_info=res["os_info"],
+                    benchmark=res["benchmark"],
+                )
+                nodes, summary = await db.list_nodes(offline_after_s=offline_s, stall_after_s=stall_s)
+                await hub.broadcast_ui({"type": "snapshot", "nodes": nodes, "summary": summary})
+                await _emit(f"[{vid}] Ready (auto-bench={res['benchmark']['recommended_workers']} workers)")
+            except UnsupportedOSError as oe:
+                await _emit(f"[{vid}] ERROR: {oe}")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await _emit(f"[{vid}] ERROR: {exc}")
+
+        task = asyncio.create_task(_run_ssh_task())
+        ssh_tasks.add(task)
+        task.add_done_callback(ssh_tasks.discard)
+        return {"ok": True, "vps_id": vid, "agent_token": raw_token, "status": "PROVISIONING"}
+
+    @app.get("/api/v1/system/backup", dependencies=[Depends(require_ui_auth)])
+    async def download_backup():
+        bundle = await export_induk_bundle(db, base_data)
+        return Response(
+            bundle,
+            media_type="application/gzip",
+            headers={"Content-Disposition": 'attachment; filename="induk-backup.tar.gz"'},
+        )
+
+    @app.post("/api/v1/system/restore", dependencies=[Depends(require_ui_auth)])
+    async def upload_restore(bundle: UploadFile = File(...)):
+        raw = await bundle.read()
+        try:
+            res = await restore_induk_bundle(raw, base_data, db)
+        except ValueError as ve:
+            raise HTTPException(status_code=400, detail=str(ve))
+        nodes, summary = await db.list_nodes(offline_after_s=offline_s, stall_after_s=stall_s)
+        await hub.broadcast_ui({"type": "snapshot", "nodes": nodes, "summary": summary})
+        return res
+
+    @app.post("/api/v1/system/migrate-induk", dependencies=[Depends(require_ui_auth)])
+    async def migrate_induk(body: MigrateIndukBody):
+        new_url = body.new_induk_url.strip().rstrip("/")
+        if not new_url.startswith(("http://", "https://")):
+            raise HTTPException(status_code=400, detail="new_induk_url must start with http:// or https://")
+        targets = body.vps_ids
+        if not targets:
+            nodes, _ = await db.list_nodes(offline_after_s=offline_s, stall_after_s=stall_s)
+            targets = [n["vps_id"] for n in nodes]
+        queued = [await _push_command_to_node(vid, "SET_INDUK", {"new_induk_url": new_url}) for vid in targets]
+        return {"ok": True, "new_induk_url": new_url, "queued": queued}
+
+    static_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+    if os.path.isdir(static_dir):
+        app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+        @app.get("/", include_in_schema=False)
+        async def serve_index():
+            return FileResponse(os.path.join(static_dir, "index.html"))
+
+    @app.websocket("/ws/agent")
+    async def ws_agent(ws: WebSocket):
+        ip = ws.client.host if ws.client else "unknown"
+        try:
+            agent_limiter.check(ip)
+        except HTTPException:
+            await ws.close(code=4429)
+            return
+        tok = _bearer_token(ws.headers.get("authorization")) or ws.query_params.get("token", "")
+        vps_id = await db.verify_agent_token(tok)
+        if not vps_id:
+            agent_limiter.record_fail(ip)
+            await ws.close(code=4401)
+            return
+        agent_limiter.reset(ip)
+        await ws.accept()
+        old_ws = hub.agent_sockets.get(vps_id)
+        if old_ws is not None and old_ws is not ws:
+            with contextlib.suppress(Exception):
+                await old_ws.close(code=4000)
+        hub.agent_sockets[vps_id] = ws
+        await db.touch_seen(vps_id, state="ONLINE")
+
+        try:
+            pending = await db.get_unacked_commands(vps_id)
+            delivered_ids: list[str] = []
+            for cmd in pending:
+                await ws.send_json({"type": "command", "command": cmd})
+                delivered_ids.append(cmd["cmd_id"])
+            await db.mark_delivered(delivered_ids)
+
+            nodes, summary = await db.list_nodes(offline_after_s=offline_s, stall_after_s=stall_s)
+            await hub.broadcast_ui({"type": "snapshot", "nodes": nodes, "summary": summary})
+
+            while True:
+                data = await ws.receive_json()
+                if not isinstance(data, dict):
+                    continue
+                mtype = str(data.get("type") or "")
+                if mtype == "telemetry":
+                    await db.update_telemetry(vps_id, data)
+                    nodes, summary = await db.list_nodes(offline_after_s=offline_s, stall_after_s=stall_s)
+                    await hub.broadcast_ui({"type": "snapshot", "nodes": nodes, "summary": summary})
+                elif mtype == "cmd_ack":
+                    cmd_id = str(data.get("cmd_id") or "")
+                    ok = bool(data.get("ok", True))
+                    msg = str(data.get("message") or "")
+                    await db.ack_command(vps_id, cmd_id, ok=ok, message=msg)
+                    await db.touch_seen(vps_id)
+                    await hub.broadcast_ui({"type": "cmd_ack", "vps_id": vps_id, "cmd_id": cmd_id, "ok": ok, "message": msg})
+                elif mtype == "ping":
+                    await db.touch_seen(vps_id)
+                    await ws.send_json({"type": "pong", "ts": time.time()})
+        except (WebSocketDisconnect, Exception):
+            pass
+        finally:
+            if hub.agent_sockets.get(vps_id) is ws:
+                hub.agent_sockets.pop(vps_id, None)
+            with contextlib.suppress(RuntimeError, Exception):
+                nodes, summary = await db.list_nodes(offline_after_s=offline_s, stall_after_s=stall_s)
+                await hub.broadcast_ui({"type": "snapshot", "nodes": nodes, "summary": summary})
+
+    @app.websocket("/ws/ui")
+    async def ws_ui(ws: WebSocket):
+        ip = ws.client.host if ws.client else "unknown"
+        try:
+            limiter.check(ip)
+        except HTTPException:
+            await ws.close(code=4429)
+            return
+        ticket = ws.query_params.get("ticket", "")
+        key = ws.headers.get("x-api-key") or ws.query_params.get("api_key", "")
+        ticket_ok = bool(ticket and ws_tickets.pop(ticket, 0.0) > time.monotonic())
+        key_ok = bool(key and hmac.compare_digest(key, resolved_key))
+        if not (ticket_ok or key_ok):
+            limiter.record_fail(ip)
+            await ws.close(code=4401)
+            return
+        limiter.reset(ip)
+        await ws.accept()
+        hub.ui_sockets.add(ws)
+        try:
+            nodes, summary = await db.list_nodes(offline_after_s=offline_s, stall_after_s=stall_s)
+            await ws.send_json({"type": "snapshot", "nodes": nodes, "summary": summary})
+            while True:
+                msg = await ws.receive_text()
+                if msg == "ping":
+                    await ws.send_json({"type": "pong"})
+        except (WebSocketDisconnect, Exception):
+            pass
+        finally:
+            hub.ui_sockets.discard(ws)
+
+    return app
+
+
+app = create_app()
