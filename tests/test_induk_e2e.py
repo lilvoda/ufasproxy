@@ -204,3 +204,49 @@ def test_job_output_zip_and_telegram_auto_and_manual_send(tmp_path, monkeypatch)
             headers=hdr,
         )
         assert tg_comb.status_code == 200 and "vps-1_vps-2" in tg_comb.json()["zip_name"]
+
+        # Full info upas card format + collector buckets + partial snapshot vs final upload
+        full_card = "\n".join([
+            "STATUS       : [NOT BANNED]  (Normal)",
+            "IDENTITAS",
+            "  Account    : Badria02:Badria02",
+            "  GUID       : 38189909",
+            "  Nickname   : mhineq03",
+            "BIND (NO SENSOR)",
+            "  Collector  : Amateur Collector V (1,100)",
+            "",
+            "-" * 60,
+            "",
+        ])
+
+        client.post(
+            "/api/v1/agent/register-job",
+            json={"job_id": "manual_full_1", "filename": "upas.txt"},
+            headers={"Authorization": f"Bearer {tok}"},
+        )
+        pbuf = io.BytesIO()
+        with zipfile.ZipFile(pbuf, "w") as zf:
+            zf.writestr("full_info_upas_valid.txt", full_card)
+            zf.writestr("full_info_by_collector/08_amateur_collector.txt", full_card)
+        prev_tg = len(tg_calls)
+        part_res = client.post(
+            "/api/v1/agent/output/manual_full_1?partial=1",
+            content=pbuf.getvalue(),
+            headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/zip"},
+        )
+        assert part_res.status_code == 200 and part_res.json()["tg_auto_sent"] is False
+        assert len(tg_calls) == prev_tg  # partial never triggers Telegram auto-send
+
+        fin_res = client.post(
+            "/api/v1/agent/output/manual_full_1",
+            content=pbuf.getvalue(),
+            headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/zip"},
+        )
+        assert fin_res.status_code == 200 and fin_res.json()["tg_auto_sent"] is True
+        assert len(tg_calls) == prev_tg + 1
+
+        dl_full = client.get("/api/v1/results/manual_full_1/zip", headers=hdr)
+        with zipfile.ZipFile(io.BytesIO(dl_full.content), "r") as zf:
+            names = set(zf.namelist())
+            assert {"summary.txt", "full_info_upas_valid.txt", "full_info_by_collector/08_amateur_collector.txt"}.issubset(names)
+            assert "Full Info: 1" in zf.read("summary.txt").decode("utf-8")

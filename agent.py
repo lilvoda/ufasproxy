@@ -717,6 +717,7 @@ class MuseAgent:
                         while not self._reconnect_needed:
                             await asyncio.to_thread(self._safe_sync_manual_job)
                             await asyncio.to_thread(self._safe_flush_hits)
+                            await asyncio.to_thread(self._safe_sync_partial_output)
                             await asyncio.to_thread(self._safe_upload_finished_output)
                             await ws.send(json.dumps(self.build_telemetry()))
                             for _ in range(30):
@@ -764,6 +765,51 @@ class MuseAgent:
         except Exception:
             pass
 
+    @staticmethod
+    def _build_output_zip_bytes(out_dir: str) -> bytes:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for fname in ("hit_valid.txt", "hit_2fa.txt", "invalid.txt", "err.txt", "full_info_upas_valid.txt"):
+                fp = os.path.join(out_dir, fname)
+                if os.path.isfile(fp) and os.path.getsize(fp) > 0:
+                    zf.write(fp, arcname=fname)
+            col_dir = os.path.join(out_dir, "full_info_by_collector")
+            if os.path.isdir(col_dir):
+                for fn in sorted(os.listdir(col_dir)):
+                    fp = os.path.join(col_dir, fn)
+                    if fn.endswith(".txt") and os.path.isfile(fp) and os.path.getsize(fp) > 0:
+                        zf.write(fp, arcname=f"full_info_by_collector/{fn}")
+        return buf.getvalue()
+
+    def _safe_sync_partial_output(self) -> None:
+        try:
+            with self._job_lock:
+                job = dict(self.active_job) if self.active_job else None
+            if not job or job.get("output_uploaded"):
+                return
+            out_dir = job.get("output_dir") or ""
+            full_fp = os.path.join(out_dir, "full_info_upas_valid.txt")
+            hit_fp = os.path.join(out_dir, "hit_valid.txt")
+            sig = (
+                os.path.getsize(full_fp) if os.path.isfile(full_fp) else 0,
+                os.path.getsize(hit_fp) if os.path.isfile(hit_fp) else 0,
+            )
+            if sig == (0, 0) or sig == tuple(job.get("_last_partial_sig") or ()):
+                return
+            zbytes = self._build_output_zip_bytes(out_dir)
+            self._http_request_raw(
+                "POST",
+                f"/api/v1/agent/output/{job['job_id']}?partial=1",
+                data=zbytes,
+                content_type="application/zip",
+                timeout=30.0,
+            )
+            with self._job_lock:
+                if self.active_job and self.active_job.get("job_id") == job.get("job_id"):
+                    self.active_job["_last_partial_sig"] = list(sig)
+        except Exception:
+            pass
+
     def upload_finished_output_sync(self, force: bool = False) -> bool:
         with self._job_lock:
             proc_alive = False
@@ -776,16 +822,10 @@ class MuseAgent:
         if not force and (proc_alive or (self.proc is None and pid and _is_pid_alive(pid))):
             return False
         out_dir = job.get("output_dir") or ""
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            for fname in ("hit_valid.txt", "hit_2fa.txt", "invalid.txt", "err.txt"):
-                fp = os.path.join(out_dir, fname)
-                if os.path.isfile(fp) and os.path.getsize(fp) > 0:
-                    zf.write(fp, arcname=fname)
         self._http_request_raw(
             "POST",
             f"/api/v1/agent/output/{job['job_id']}",
-            data=buf.getvalue(),
+            data=self._build_output_zip_bytes(out_dir),
             content_type="application/zip",
             timeout=30.0,
         )

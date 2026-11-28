@@ -25,6 +25,13 @@ if "Crypto.Cipher" not in sys.modules:
         sys.modules["Crypto"] = cr
         sys.modules["Crypto.Cipher"] = cc
 
+if "zstandard" not in sys.modules:
+    try:
+        import zstandard  # noqa: F401
+    except ImportError:
+        sys.modules["zstandard"] = types.ModuleType("zstandard")
+
+import info as _info
 import old_browser_vpn as obv
 
 
@@ -72,3 +79,31 @@ def test_vpncoordinator_recursive_provider_subfolders_and_per_dir_auth(tmp_path,
     a0 = cmd0[cmd0.index("--auth-user-pass") + 1]
     a1 = cmd1[cmd1.index("--auth-user-pass") + 1]
     assert a0 != a1 and "vpns-proton" in a0 and "vpns-surfshark" in a1
+
+
+def test_full_upas_info_formatter_and_collector_buckets():
+    binds, reg_ts = _info.parse_binds([
+        {0: "mt-and_1", 1: {"email": "a@b.com", "register_time": "1619606100"}},
+        {0: "gg_123", 1: {"email": "g@gmail.com"}},
+    ])
+    assert reg_ts == 1619606100 and "a@b.com" in binds["Moonton"] and "g@gmail.com" in binds["Google"]
+    lbl, bkt = _info.map_collector(49420)
+    assert lbl == "Renowned Collector V (49,420)" and bkt == "04_renowned_collector.txt"
+    banned, binfo = _info.inspect_ban({"ban_reason": "24", "endtime_day": 30})
+    assert banned and binfo["reason_name"] == "Cheating in Ranked Match"
+    card = _info.format_full_card({
+        "upas": "u:p", "guid": 123, "no_role": False, "ban_seen": False, "ban_info": {},
+        "nick": "Hero", "rid": 111, "zid": 222, "other_roles": [], "level": 45,
+        "country": "ID", "alamat": "Indonesia", "squad": "-", "dibuat": "28 Apr 2021 17:35 WIB",
+        "last_on": "-", "last_match": "-", "binds": binds, "v2l": False,
+        "risk": "Low", "flags_pct": 0.0, "credits": 100, "followers": 10, "likes": 20,
+        "bp": 1000, "diamonds": 5, "tickets": 2, "rank_now": "Epic II", "rank_max": "Mythic 10",
+        "wr": "55.00%  (11/20)", "heroes": 19, "skins": 8,
+        "sup": 0, "grd": 0, "exq": 0, "dlx": 1, "exc": 0, "com": 7, "collector": lbl,
+    })
+    assert "STATUS       : [NOT BANNED]  (Normal)" in card and "BIND (NO SENSOR)" in card and "WALLET" in card
+    norole_card = _info.format_full_card({
+        "upas": "x:y", "guid": 456, "no_role": True, "ban_seen": False, "ban_info": {},
+        "binds": binds, "v2l": True, "country": "ID",
+    })
+    assert "Belum Buat Karakter" in norole_card and "2FA        : AKTIF" in norole_card

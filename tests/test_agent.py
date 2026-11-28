@@ -95,30 +95,44 @@ def test_agent_dead_pid_tar_symlink_and_reap(tmp_path):
 
     ag2 = MuseAgent(vps_id="vps-2", induk_url="http://127.0.0.1:8000", token="t", work_dir=str(tmp_path))
     ag2.proc = subprocess.Popen([sys.executable, "-c", "pass"])
-    for _ in range(120):
-        if not _is_pid_alive(ag2.proc.pid):
-            break
-        time.sleep(0.05)
+    if sys.platform == "win32":
+        import _winapi
+        _winapi.WaitForSingleObject(int(ag2.proc._handle), 5000)
+    else:
+        for _ in range(120):
+            if not _is_pid_alive(ag2.proc.pid):
+                break
+            time.sleep(0.05)
     ag2.active_job = {"pid": ag2.proc.pid, "job_id": "j2", "status_json": "", "output_dir": str(tmp_path), "offsets": {}}
     ag2.build_telemetry()
     assert ag2.proc.returncode is not None
     ok_rot, _ = ag2.execute_command({"type": "ROTATE_VPN", "payload": {}})
     assert ok_rot is False
 
-    # Finished output packaging uploads non-empty files once
+    # Finished output packaging uploads non-empty files once (including full_info_upas_valid & collector buckets)
     out3 = tmp_path / "out_zip"
     out3.mkdir()
     (out3 / "hit_valid.txt").write_text("u:p|t|1|n|2026\n", encoding="utf-8")
     (out3 / "invalid.txt").write_text("x:y|2026\n", encoding="utf-8")
     (out3 / "hit_2fa.txt").write_text("", encoding="utf-8")
+    (out3 / "full_info_upas_valid.txt").write_text("STATUS       : [NOT BANNED]\n", encoding="utf-8")
+    (out3 / "full_info_by_collector").mkdir()
+    (out3 / "full_info_by_collector" / "08_amateur_collector.txt").write_text("STATUS       : [NOT BANNED]\n", encoding="utf-8")
     uploaded = []
     ag2._http_request_raw = lambda m, p, data=None, content_type="", timeout=15.0: uploaded.append((p, data)) or b"{}"
     ag2.active_job = {"pid": ag2.proc.pid, "job_id": "job_zip_1", "status_json": "", "output_dir": str(out3), "offsets": {}}
+    ag2._safe_sync_partial_output()
+    assert uploaded and uploaded[0][0] == "/api/v1/agent/output/job_zip_1?partial=1"
     assert ag2.upload_finished_output_sync() is True
     assert ag2.upload_finished_output_sync() is False
-    assert len(uploaded) == 1 and uploaded[0][0] == "/api/v1/agent/output/job_zip_1"
-    with zipfile.ZipFile(io.BytesIO(uploaded[0][1]), "r") as zf:
-        assert set(zf.namelist()) == {"hit_valid.txt", "invalid.txt"}
+    assert len(uploaded) == 2 and uploaded[1][0] == "/api/v1/agent/output/job_zip_1"
+    with zipfile.ZipFile(io.BytesIO(uploaded[1][1]), "r") as zf:
+        assert set(zf.namelist()) == {
+            "hit_valid.txt",
+            "invalid.txt",
+            "full_info_upas_valid.txt",
+            "full_info_by_collector/08_amateur_collector.txt",
+        }
 
     # RESTART must NOT trigger finished output upload for the same job_id
     ag2.active_job = {"pid": ag2.proc.pid, "job_id": "job_restart_1", "status_json": "", "output_dir": str(out3), "offsets": {}, "payload": {"job_id": "job_restart_1"}}

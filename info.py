@@ -1,3 +1,4 @@
+import datetime
 import time
 import random
 import socket
@@ -838,3 +839,434 @@ def get_player_info(
             continue
 
     return None
+
+
+_WIB = datetime.timezone(datetime.timedelta(hours=7))
+_MONTHS_ID = ("Jan", "Feb", "Mar", "Apr", "Mei", "Jun", "Jul", "Agu", "Sep", "Okt", "Nov", "Des")
+_COUNTRY_NAMES = {
+    "ID": "Indonesia", "MY": "Malaysia", "PH": "Philippines", "SG": "Singapore",
+    "BR": "Brazil", "US": "United States", "VN": "Vietnam", "TH": "Thailand",
+    "MM": "Myanmar", "KH": "Cambodia", "IN": "India", "TR": "Turkey",
+    "RU": "Russia", "SA": "Saudi Arabia", "JP": "Japan", "KR": "South Korea",
+}
+_BAN_REASONS = {
+    "21": "Using Plug-in Apps to Compromise Competitive Fairness",
+    "22": "Account Sharing / Boosting",
+    "23": "Verbal Abuse / Toxic Behavior",
+    "24": "Cheating in Ranked Match",
+    "25": "Payment Fraud / Chargeback",
+    "26": "Account Trading / Sale",
+}
+_COLLECTOR_TIERS = (
+    (280000, float("inf"), "World Collector", "01_world_collector.txt"),
+    (160000, 280000, "Mega Collector", "02_mega_collector.txt"),
+    (84000, 160000, "Exalted Collector", "03_exalted_collector.txt"),
+    (44000, 84000, "Renowned Collector", "04_renowned_collector.txt"),
+    (22000, 44000, "Expert Collector", "05_expert_collector.txt"),
+    (10000, 22000, "Seasoned Collector", "06_seasoned_collector.txt"),
+    (4000, 10000, "Junior Collector", "07_junior_collector.txt"),
+    (1000, 4000, "Amateur Collector", "08_amateur_collector.txt"),
+)
+
+
+def fmt_wib(ts: Any) -> str:
+    try:
+        t = int(ts)
+    except Exception:
+        return "-"
+    if t < 1400000000 or t > 2000000000:
+        return "-"
+    dt = datetime.datetime.fromtimestamp(t, datetime.timezone.utc).astimezone(_WIB)
+    return f"{dt.day:02d} {_MONTHS_ID[dt.month - 1]} {dt.year} {dt.strftime('%H:%M')} WIB"
+
+
+def map_collector(pt: Any) -> tuple[str, str]:
+    try:
+        p = int(pt)
+    except Exception:
+        return "Collector (0)", "09_collector.txt"
+    for lo, hi, name, bucket in _COLLECTOR_TIERS:
+        if lo <= p < hi:
+            if name == "World Collector":
+                return f"{name} ({p:,})", bucket
+            lvl = max(0, min(4, int((p - lo) // ((hi - lo) / 5))))
+            roman = ["V", "IV", "III", "II", "I"][lvl]
+            return f"{name} {roman} ({p:,})", bucket
+    return f"Collector ({p:,})", "09_collector.txt"
+
+
+def inspect_ban(obj: Any, out: Optional[Dict] = None, depth: int = 0) -> tuple[bool, Dict]:
+    if out is None:
+        out = {}
+    if depth > 6:
+        return False, out
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            kl = str(k).lower()
+            if k == "ban_reason" and str(v) not in ("", "0"):
+                out["ban_code"] = str(v)
+                out["reason_name"] = _BAN_REASONS.get(str(v), f"Code {v}")
+            elif k == "endtime_day" and v not in (None, 0):
+                out["endtime_day"] = v
+            elif k in ("endtime_hour", "endtime_min", "endtime_sec") and v not in (None, 0):
+                out[k] = v
+            elif "ban_status" in kl and v not in (None, 0, False, "0", ""):
+                out["ban_status_raw"] = v
+            if isinstance(v, (dict, list)):
+                inspect_ban(v, out, depth + 1)
+    elif isinstance(obj, list):
+        for it in obj:
+            inspect_ban(it, out, depth + 1)
+    return bool(out.get("endtime_day")), out
+
+
+def parse_binds(cand1: Any) -> tuple[Dict[str, str], int]:
+    res = {
+        "Moonton": "Terhubung (Akun Moonton Aktif)",
+        "Google": "Unbind",
+        "Facebook": "Unbind",
+        "Vk": "Unbind",
+        "Tiktok": "Unbind",
+        "Apple": "Unbind",
+        "Whatsapp": "Unbind",
+        "Telegram": "Unbind",
+    }
+    reg_ts = 0
+    for entry in (cand1 or []):
+        if not isinstance(entry, dict):
+            continue
+        raw_id = str(entry.get(0, "") or "")
+        low = raw_id.lower()
+        meta = entry.get(1) if isinstance(entry.get(1), dict) else {}
+        if not reg_ts and str(meta.get("register_time", "")).isdigit():
+            reg_ts = int(meta["register_time"])
+        detail = meta.get("email") or meta.get("name") or meta.get("nick") or ""
+        lbl = f"Terhubung ({detail})" if detail else "Terhubung"
+        if low.startswith(("mt-", "mt_")):
+            res["Moonton"] = f"Terhubung ({detail})" if detail else "Terhubung (Akun Moonton Aktif)"
+        elif low.startswith(("gg_", "gp_", "google_")):
+            res["Google"] = lbl
+        elif low.startswith(("fb-", "fb_")):
+            res["Facebook"] = lbl
+        elif low.startswith(("vk-", "vk_")):
+            res["Vk"] = lbl
+        elif low.startswith(("tt_", "tt-", "tiktok_")):
+            res["Tiktok"] = lbl
+        elif low.startswith(("apple_", "ap_")):
+            res["Apple"] = lbl
+        elif low.startswith(("wa_", "wa-", "whatsapp_")):
+            res["Whatsapp"] = lbl
+        elif low.startswith(("tg_", "tg-", "telegram_")):
+            res["Telegram"] = lbl
+    return res, reg_ts
+
+
+def _safe_rank(v: Any) -> str:
+    if v is None or v == "":
+        return "Warrior III"
+    try:
+        return map_rank(int(v))
+    except Exception:
+        return str(v)
+
+
+def format_full_card(d: Dict) -> str:
+    if d.get("ban_seen"):
+        bi = d.get("ban_info") or {}
+        st_str = f"[BANNED]  ({bi.get('reason_name') or 'Banned'})"
+    else:
+        st_str = "[NOT BANNED]  (Normal)"
+    b = d["binds"]
+    fa_str = "AKTIF" if d["v2l"] else "TIDAK AKTIF"
+    if d.get("no_role"):
+        return "\n".join([
+            f"STATUS       : {st_str}",
+            "IDENTITAS",
+            f"  Account    : {d['upas']}",
+            f"  GUID       : {d['guid']}",
+            "  Nickname   : - (Belum Buat Karakter)",
+            f"  Negara     : {d['country'] or '-'}",
+            "",
+            "BIND (NO SENSOR)",
+            f"  Moonton    : {b['Moonton']}",
+            f"  Google     : {b['Google']}",
+            f"  Facebook   : {b['Facebook']}",
+            f"  Vk         : {b['Vk']}",
+            f"  Tiktok     : {b['Tiktok']}",
+            f"  Apple      : {b['Apple']}",
+            f"  Whatsapp   : {b['Whatsapp']}",
+            f"  Telegram   : {b['Telegram']}",
+            f"  2FA        : {fa_str}",
+            "",
+            "-" * 60,
+            "",
+        ])
+
+    srv_lain = ", ".join(d["other_roles"]) if d["other_roles"] else "-"
+    return "\n".join([
+        f"STATUS       : {st_str}",
+        "IDENTITAS",
+        f"  Account    : {d['upas']}",
+        f"  GUID       : {d['guid']}",
+        f"  Nickname   : {d['nick']}",
+        f"  Role ID    : {d['rid']} ({d['zid']})",
+        f"  Server Lain: {srv_lain}",
+        f"  Level      : {d['level']}",
+        f"  Negara     : {d['country']}",
+        f"  Alamat     : {d['alamat']}",
+        f"  Squad      : {d['squad']}",
+        f"  Dibuat     : {d['dibuat']}",
+        f"  Last On    : {d['last_on']}",
+        f"  Last Match : {d['last_match']}",
+        "",
+        "BIND (NO SENSOR)",
+        f"  Moonton    : {b['Moonton']}",
+        f"  Google     : {b['Google']}",
+        f"  Facebook   : {b['Facebook']}",
+        f"  Vk         : {b['Vk']}",
+        f"  Tiktok     : {b['Tiktok']}",
+        f"  Apple      : {b['Apple']}",
+        f"  Whatsapp   : {b['Whatsapp']}",
+        f"  Telegram   : {b['Telegram']}",
+        f"  2FA        : {fa_str}",
+        "",
+        f"RISIKO       : {d['risk']}  -  Flags {d['flags_pct']:.1f}%  -  Credits {d['credits']}",
+        f"Followers    : {d['followers']}  -  Likes {d['likes']}",
+        "",
+        "WALLET",
+        f"  BP         : {d['bp']:,}",
+        f"  Diamond    : {d['diamonds']:,}",
+        f"  Ticket     : {d['tickets']:,}",
+        "",
+        "RANK",
+        f"  Now        : {d['rank_now']}",
+        f"  Max        : {d['rank_max']}",
+        f"  WinRate    : {d['wr']}",
+        "",
+        "HERO & SKIN",
+        f"  Hero       : {d['heroes']}/154",
+        f"  Skin       : {d['skins']}/1134",
+        f"  Supreme    : {d['sup']:<4} | Grand : {d['grd']}",
+        f"  Exq        : {d['exq']:<4} | Deluxe: {d['dlx']}",
+        f"  Except     : {d['exc']:<4} | Common: {d['com']}",
+        f"  Collector  : {d['collector']}",
+        "",
+        "-" * 60,
+        "",
+    ])
+
+
+def get_full_upas_info(
+    guid: int,
+    session: str,
+    device_manager: DeviceManager,
+    upas: str = "",
+    deadline_s: float = 13.5,
+) -> Optional[Dict]:
+    """Fetch complete UPAS card (binds, status, identity, wallet, rank, skins, collector) for a valid login."""
+    cand = None
+    ban_seen = False
+    ban_info: Dict = {}
+    rd = None
+    ri = None
+    rid = None
+    zid = 0
+    roles_sorted: List = []
+    deadline = time.monotonic() + deadline_s
+
+    resolver_devs = [d for d in device_manager.devices if len(d) >= 88] or [_SESSION_RESOLVER_DEVICE]
+    for rdev in resolver_devs[:2]:
+        if time.monotonic() >= deadline:
+            break
+        rc = GameConnection(device_id=rdev, device_manager=device_manager)
+        try:
+            rc.connect()
+            if rc.login_to_login_server() and rc.get_game_server() and rc.connect_to_game_server(max_retries=2, deadline=deadline):
+                for atype in ("and", "ios"):
+                    if time.monotonic() >= deadline:
+                        break
+                    rc.send_data(10207, SdpStruct({0: f"mt-{atype}_{guid}", 1: f"token={session}&name=&id={guid}&nid=", 2: 0}))
+                    dl = min(deadline, time.monotonic() + 4.5)
+                    while time.monotonic() < dl:
+                        cmd, msg = rc.recv_data()
+                        if cmd is None:
+                            break
+                        if cmd in (20001, -1, 20313):
+                            continue
+                        if cmd == 10208 and msg:
+                            b, bi = inspect_ban(msg)
+                            if b:
+                                ban_seen, ban_info = True, bi
+                            if any(str(guid) in str(x.get(0, "")) for x in (msg.get(1) or []) if isinstance(x, dict)):
+                                cand = msg
+                                break
+                            if not msg.get(1) and msg.get(2):
+                                cand = msg
+                                break
+                    if cand is not None:
+                        roles_raw = [r for r in (cand.get(2) or []) if isinstance(r, dict) and r.get(1)]
+                        if roles_raw:
+                            roles_sorted = sorted(roles_raw, key=lambda r: int(r.get(3, 0) or 0), reverse=True)
+                            rid = int(roles_sorted[0].get(1))
+                            zid = int(roles_sorted[0].get(0, 0))
+                            rd = rc.get_role_detail(rid, deadline=deadline)
+                            ri = rc.get_role_info(rid, zid, deadline=deadline)
+                        break
+        except Exception:
+            pass
+        finally:
+            rc.cleanup()
+        if cand is not None:
+            break
+
+    if cand is None:
+        return None
+
+    acct_label = upas or f"GUID:{guid}"
+    binds, reg_ts = parse_binds(cand.get(1))
+    v2l = (cand.get(13, 0) == 1)
+
+    if not roles_sorted or not rid:
+        d = {
+            "upas": acct_label, "guid": guid, "no_role": True,
+            "binds": binds, "v2l": v2l, "ban_seen": ban_seen, "ban_info": ban_info,
+            "country": (cand.get(23).get(0, "") if isinstance(cand.get(23), dict) else ""),
+        }
+        return {
+            "status": "success",
+            "data": {
+                "basic_info": {"nickname": "BelumBuatKarakter", "player_id": "Unknown", "server": "Unknown", "level": 0, "skin_count": 0},
+                "game_info": {"current_rank": "Unknown", "high_rank": "Unknown"},
+                "collector_info": {"collector_tier": "No Role", "collector_point": 0},
+            },
+            "full_data": d,
+            "full_card": format_full_card(d),
+            "collector_bucket": "10_belum_buat_karakter.txt",
+        }
+
+    for _ in range(2):
+        if rd or ri or time.monotonic() >= deadline:
+            break
+        dev = device_manager.get_next_device()
+        if not dev:
+            break
+        conn = GameConnection(device_id=dev, device_manager=device_manager)
+        try:
+            conn.connect()
+            if conn.login_to_login_server() and conn.get_game_server() and conn.connect_to_game_server(max_retries=2, deadline=deadline):
+                rd = conn.get_role_detail(rid, deadline=deadline)
+                ri = conn.get_role_info(rid, zid, deadline=deadline)
+        except Exception:
+            pass
+        finally:
+            conn.cleanup()
+
+    other_roles = [f"{int(r.get(1))} ({int(r.get(0, 0))}) Lv.{int(r.get(3, 0) or 0)}" for r in roles_sorted[1:]]
+    p = rd[0][0] if (rd and rd.get(0) and isinstance(rd[0], list) and rd[0]) else {}
+    ri = ri or {}
+    for src_d in (p, ri):
+        b, bi = inspect_ban(src_d)
+        if b:
+            ban_seen, ban_info = True, bi
+
+    nick = str(ri.get(2) or p.get(2) or roles_sorted[0].get(2) or "Unknown")
+    level = int(ri.get(3) or p.get(3) or roles_sorted[0].get(3) or 0)
+    cc_raw = (p.get(97) or (cand.get(23).get(0, "") if isinstance(cand.get(23), dict) else "") or p.get(87) or "").upper()
+    loc = p.get(71)
+    if isinstance(loc, list) and len(loc) >= 1 and any(loc):
+        alamat = ", ".join(str(x) for x in loc if x)
+    elif cc_raw in _COUNTRY_NAMES:
+        alamat = _COUNTRY_NAMES[cc_raw]
+    else:
+        alamat = cc_raw or "-"
+
+    sq_icon = str(p.get(31) or "").strip()
+    sq_name = str(p.get(30) or "").replace("`", "").strip()
+    squad = f"{sq_icon} {sq_name}".strip() if sq_name else "-"
+
+    created_ts = p.get(42, 0) or p.get(6, 0) or reg_ts or 0
+    if int(created_ts or 0) < 1400000000:
+        created_ts = reg_ts or 0
+    last_on_ts = p.get(5, 0) or roles_sorted[0].get(4, 0) or 0
+
+    t117 = ri.get(117) or p.get(117) or p.get(135) or {}
+    f_raw = t117.get(0, 0) if isinstance(t117, dict) else (t117 if isinstance(t117, int) else 0)
+    if isinstance(ri.get(117), dict) or isinstance(p.get(117), dict):
+        flags_pct = round((bin(int(f_raw)).count("1") / 7) * 100, 1) if f_raw else 0.0
+    else:
+        flags_pct = 0.0
+    risk_lbl = "Low" if flags_pct < 30 else ("Medium" if flags_pct < 60 else "High")
+    credits = int(p.get(80) or ri.get(20) or 100)
+    if credits > 110:
+        credits = 100
+
+    followers = int(ri.get(23) or p.get(15) or 0)
+    likes = int(ri.get(24) or p.get(61) or 0)
+
+    cur111 = ri.get(111) or p.get(111)
+    diamonds = 0
+    bp = 0
+    if isinstance(cur111, dict):
+        d0 = int(cur111.get(0, 0) or 0)
+        d1 = int(cur111.get(1, 0) or 0)
+        if d0 < 10_000_000:
+            diamonds = d0
+        if d1 < 100_000_000:
+            bp = d1
+    if not bp and int(ri.get(66, 0) or p.get(66, 0) or 0) <= 10_000_000:
+        bp = int(ri.get(66, 0) or p.get(66, 0) or 0)
+    tickets = int(ri.get(49, 0) or p.get(49, 0) or 0)
+
+    r_now_v = ri.get(6) if ri.get(6) is not None else p.get(8)
+    r_max_v = ri.get(15) if ri.get(15) is not None else p.get(95)
+    rank_now = _safe_rank(r_now_v)
+    rank_max = _safe_rank(r_max_v)
+
+    m1 = int(ri.get(22) or p.get(17) or 0)
+    m2 = int(ri.get(77) or p.get(18) or 0)
+    if m1 > 0 and m2 > 0:
+        wins, total_m = (m1, m2) if m1 <= m2 else (m2, m1)
+        wr_str = f"{(wins / total_m) * 100:.2f}%  ({wins}/{total_m})"
+    else:
+        wr_str = "0.00%  (0/0)"
+
+    heroes = int(ri.get(9) or p.get(4) or 0)
+    skins = int(ri.get(10) or p.get(83) or 0)
+    t118 = ri.get(118) or {}
+    tier_d = t118.get(4) if isinstance(t118.get(4), dict) else {}
+    sup = int(tier_d.get(6, 0) or 0)
+    grd = int(tier_d.get(5, 0) or 0)
+    exq = int(tier_d.get(4, 0) or 0)
+    dlx = int(tier_d.get(3, 0) or 0)
+    exc = int(tier_d.get(2, 0) or 0)
+    com = int(tier_d.get(1, 0) or 0)
+    t136 = p.get(136) if isinstance(p.get(136), dict) else {}
+    col_pts = int(t118.get(1) or t136.get(9) or 0)
+    col_label, col_bucket = map_collector(col_pts)
+
+    d = {
+        "upas": acct_label, "guid": guid, "no_role": False,
+        "ban_seen": ban_seen, "ban_info": ban_info,
+        "nick": nick, "rid": rid, "zid": zid, "other_roles": other_roles,
+        "level": level, "country": cc_raw or "-", "alamat": alamat, "squad": squad,
+        "dibuat": fmt_wib(created_ts), "last_on": fmt_wib(last_on_ts), "last_match": "-",
+        "binds": binds, "v2l": v2l,
+        "risk": risk_lbl, "flags_pct": flags_pct, "credits": credits,
+        "followers": followers, "likes": likes,
+        "bp": bp, "diamonds": diamonds, "tickets": tickets,
+        "rank_now": rank_now, "rank_max": rank_max, "wr": wr_str,
+        "heroes": heroes, "skins": skins,
+        "sup": sup, "grd": grd, "exq": exq, "dlx": dlx, "exc": exc, "com": com,
+        "collector": col_label,
+    }
+    return {
+        "status": "success",
+        "data": {
+            "basic_info": {"nickname": nick, "player_id": rid, "server": zid, "level": level, "skin_count": skins},
+            "game_info": {"current_rank": rank_now, "high_rank": rank_max},
+            "collector_info": {"collector_tier": col_label, "collector_point": col_pts},
+        },
+        "full_data": d,
+        "full_card": format_full_card(d),
+        "collector_bucket": col_bucket,
+    }

