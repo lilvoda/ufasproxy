@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import io
 import json
@@ -122,6 +123,7 @@ class MuseAgent:
         self.state_dir = os.path.join(self.work_dir, ".agent_state")
         os.makedirs(self.state_dir, exist_ok=True)
         self.active_job_path = os.path.join(self.state_dir, "active_job.json")
+        self.manual_job_path = os.path.join(self.state_dir, "manual_job.json")
         self.seen_cmds_path = os.path.join(self.state_dir, "seen_cmds.json")
         self.bench_path = os.path.join(self.state_dir, "benchmark.json")
         self._job_lock = threading.Lock()
@@ -218,9 +220,81 @@ class MuseAgent:
             json.dump(info, f)
         os.replace(tmp, self.active_job_path)
 
+    def _register_manual_job_if_needed(self) -> None:
+        with self._job_lock:
+            job = dict(self.active_job) if self.active_job else None
+        if not job or not job.get("manual") or job.get("manual_registered"):
+            return
+        cname = str((job.get("payload") or {}).get("combo_name") or "")
+        self._http_request("POST", "/api/v1/agent/register-job", {"job_id": job["job_id"], "filename": cname})
+        with self._job_lock:
+            if self.active_job and self.active_job.get("job_id") == job.get("job_id"):
+                self.active_job["manual_registered"] = True
+                self.save_active_job(self.active_job)
+
+    def adopt_manual_job_sync(self) -> bool:
+        if not os.path.isfile(self.manual_job_path):
+            return False
+        with self._job_lock:
+            if self.active_job:
+                proc_alive = self.proc is not None and self.proc.poll() is None
+                pid_prev = int(self.active_job.get("pid") or 0)
+                if proc_alive or (self.proc is None and pid_prev and _is_pid_alive(pid_prev)):
+                    return False
+                need_prev_flush = not self.active_job.get("output_uploaded")
+            else:
+                need_prev_flush = False
+        if need_prev_flush:
+            self._safe_flush_hits()
+            self._safe_upload_finished_output(force=True)
+        adopted = False
+        with self._job_lock:
+            if not os.path.isfile(self.manual_job_path):
+                return False
+            try:
+                info = json.loads(open(self.manual_job_path, encoding="utf-8").read())
+            except Exception:
+                return False
+            jid = str(info.get("job_id") or "").strip()
+            pid = int(info.get("pid") or 0)
+            if not jid or not pid:
+                return False
+            with contextlib.suppress(OSError):
+                os.remove(self.manual_job_path)
+            self.proc = None
+            self.save_active_job(
+                {
+                    "pid": pid,
+                    "job_id": jid,
+                    "output_dir": str(info.get("output_dir") or ""),
+                    "status_json": str(info.get("status_json") or ""),
+                    "offsets": {},
+                    "manual": True,
+                    "manual_registered": False,
+                    "payload": {
+                        "job_id": jid,
+                        "local_combo_path": str(info.get("combo_path") or ""),
+                        "combo_name": str(info.get("combo_name") or ""),
+                    },
+                }
+            )
+            adopted = True
+        if adopted:
+            with contextlib.suppress(Exception):
+                self._register_manual_job_if_needed()
+        return adopted
+
+    def _safe_sync_manual_job(self) -> None:
+        try:
+            self.adopt_manual_job_sync()
+            self._register_manual_job_if_needed()
+        except Exception:
+            pass
+
     def load_or_reattach_job(self) -> dict | None:
         if not os.path.isfile(self.active_job_path):
-            return None
+            self.adopt_manual_job_sync()
+            return self.active_job
         try:
             info = json.loads(open(self.active_job_path, encoding="utf-8").read())
         except Exception:
@@ -236,7 +310,8 @@ class MuseAgent:
             self.save_active_job(None)
         except Exception:
             pass
-        return None
+        self.adopt_manual_job_sync()
+        return self.active_job
 
     def apply_new_induk(self, new_url: str) -> None:
         clean = new_url.strip().rstrip("/")
@@ -454,8 +529,12 @@ class MuseAgent:
         if not _SAFE_ID_RE.match(raw_jid) or ".." in raw_jid:
             raise ValueError(f"Invalid job_id: {raw_jid!r}")
         job_id = raw_jid
-        combo_url = str(payload.get("combo_url") or f"/api/v1/agent/combo/{job_id}/{self.vps_id}")
-        combo_raw = self._http_request("GET", combo_url, timeout=30.0)
+        local_combo = str(payload.get("local_combo_path") or "").strip()
+        combo_url = str(payload.get("combo_url") or "")
+        if local_combo and not combo_url and os.path.isfile(local_combo):
+            combo_raw = open(local_combo, "rb").read()
+        else:
+            combo_raw = self._http_request("GET", combo_url or f"/api/v1/agent/combo/{job_id}/{self.vps_id}", timeout=30.0)
         with self._job_lock:
             prev_alive = bool(self.active_job and _is_pid_alive(int(self.active_job.get("pid") or 0)))
             if self.active_job and prev_alive:
@@ -636,6 +715,7 @@ class MuseAgent:
 
                     async def _sender() -> None:
                         while not self._reconnect_needed:
+                            await asyncio.to_thread(self._safe_sync_manual_job)
                             await asyncio.to_thread(self._safe_flush_hits)
                             await asyncio.to_thread(self._safe_upload_finished_output)
                             await ws.send(json.dumps(self.build_telemetry()))

@@ -6332,6 +6332,22 @@ async def async_main():
     ], bc=GRAY)
 
     _status_json_path = (args.status_json or '').strip()
+    _is_manual_telemetry = not bool(_status_json_path)
+    _ag_base = BASE
+    if _is_manual_telemetry and os.path.isfile('/etc/ufasproxy-agent/env'):
+        try:
+            for _env_ln in open('/etc/ufasproxy-agent/env', encoding='utf-8', errors='ignore'):
+                if _env_ln.startswith('WORK_DIR='):
+                    _cand_wd = _env_ln.split('=', 1)[1].strip()
+                    if _cand_wd and os.path.isdir(_cand_wd):
+                        _ag_base = _cand_wd
+                    break
+        except OSError:
+            pass
+    _agent_state_dir = os.path.join(_ag_base, '.agent_state')
+    _manual_job_path = os.path.join(_agent_state_dir, 'manual_job.json')
+    if _is_manual_telemetry:
+        _status_json_path = os.path.join(_agent_state_dir, 'manual_status.json')
     _rotate_trig_path = (args.rotate_trigger or '').strip()
     _last_heal_info: dict | None = None
     live_pool = None
@@ -6345,6 +6361,7 @@ async def async_main():
     def _flush_status_json():
         if _status_json_path:
             try:
+                os.makedirs(os.path.dirname(_status_json_path), exist_ok=True)
                 _write_json_atomic(
                     _status_json_path,
                     _build_status_snapshot(
@@ -6445,6 +6462,26 @@ async def async_main():
         except RuntimeError as le:
             p_out(f"{c(RED)}[!] {le}{W}")
             return
+        if _is_manual_telemetry:
+            try:
+                import secrets as _sec_m
+                os.makedirs(_agent_state_dir, exist_ok=True)
+                if os.path.isfile(_status_json_path):
+                    os.remove(_status_json_path)
+                stats['total'] = len(queue)
+                _combo_stem = re.sub(r'[^A-Za-z0-9._-]+', '_', os.path.splitext(os.path.basename(combo_path))[0]).strip('._-')[:40]
+                _write_json_atomic(_manual_job_path, {
+                    'pid': os.getpid(),
+                    'job_id': f"manual_{int(time.time())}_{_sec_m.token_hex(2)}",
+                    'output_dir': OUTPUT_DIR,
+                    'status_json': _status_json_path,
+                    'combo_path': combo_path,
+                    'combo_name': _combo_stem,
+                    'manual': True,
+                })
+                _flush_status_json()
+            except Exception:
+                pass
         if vpn_coord and vpn_coord.ovpn_files:
             if not skip_ovpn_test:
                 good_ovpns = await vpn_coord.probe_ovpns(use_cache=not bool(args.retest_ovpn))

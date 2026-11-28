@@ -95,7 +95,7 @@ def test_agent_dead_pid_tar_symlink_and_reap(tmp_path):
 
     ag2 = MuseAgent(vps_id="vps-2", induk_url="http://127.0.0.1:8000", token="t", work_dir=str(tmp_path))
     ag2.proc = subprocess.Popen([sys.executable, "-c", "pass"])
-    for _ in range(40):
+    for _ in range(120):
         if not _is_pid_alive(ag2.proc.pid):
             break
         time.sleep(0.05)
@@ -126,3 +126,32 @@ def test_agent_dead_pid_tar_symlink_and_reap(tmp_path):
     ag2._start_checker = lambda p, upload_prev=True: called_restart.append(upload_prev) or "ok"
     ok_rs, _ = ag2.execute_command({"type": "RESTART", "payload": {}})
     assert ok_rs is True and called_restart == [False]
+
+    # Manual run marker (manual_job.json) is auto-adopted, registered, and reports telemetry
+    man_proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
+    try:
+        ag3 = MuseAgent(vps_id="vps-3", induk_url="http://127.0.0.1:8000", token="t", work_dir=str(tmp_path / "m"))
+        reg_calls = []
+        ag3._http_request = lambda m, p, body=None, timeout=15.0: reg_calls.append((p, body)) or b'{"ok":true}'
+        man_out = tmp_path / "m" / "output" / "koi"
+        man_out.mkdir(parents=True)
+        man_stat = tmp_path / "m" / ".agent_state" / "manual_status.json"
+        man_stat.write_text(json.dumps({"stats": {"status": "RUNNING", "checked": 3, "total": 10}, "log_tail": ["hit ok"]}))
+        (tmp_path / "m" / ".agent_state" / "manual_job.json").write_text(
+            json.dumps({
+                "pid": man_proc.pid,
+                "job_id": "manual_123_ab",
+                "output_dir": str(man_out),
+                "status_json": str(man_stat),
+                "combo_name": "koi",
+                "manual": True,
+            })
+        )
+        assert ag3.adopt_manual_job_sync() is True
+        assert not (tmp_path / "m" / ".agent_state" / "manual_job.json").exists()
+        assert reg_calls and reg_calls[0][0] == "/api/v1/agent/register-job" and reg_calls[0][1]["filename"] == "koi"
+        mtel = ag3.build_telemetry()
+        assert mtel["agent_state"] == "RUNNING" and mtel["job_id"] == "manual_123_ab" and mtel["progress"]["checked"] == 3
+    finally:
+        man_proc.terminate()
+        man_proc.wait(timeout=5)

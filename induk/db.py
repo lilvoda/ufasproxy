@@ -451,6 +451,26 @@ class IndukDB:
         async with self._lock:
             await asyncio.to_thread(_op)
 
+    async def upsert_manual_job(self, job_id: str, vps_id: str, filename: str = "") -> None:
+        now = time.time()
+        cfg_json = json.dumps({"vps_ids": [vps_id], "filename": filename, "workers": "manual"})
+
+        def _op() -> None:
+            conn = self._ensure_conn()
+            conn.execute(
+                """
+                INSERT INTO jobs(job_id, mode, status, config_json, created_at)
+                VALUES(?, 'manual', 'RUNNING', ?, ?)
+                ON CONFLICT(job_id) DO UPDATE SET
+                    config_json = CASE WHEN jobs.config_json = '{}' THEN excluded.config_json ELSE jobs.config_json END
+                """,
+                (job_id, cfg_json, now),
+            )
+            conn.commit()
+
+        async with self._lock:
+            await asyncio.to_thread(_op)
+
     async def get_job(self, job_id: str) -> dict | None:
         def _op() -> dict | None:
             row = self._ensure_conn().execute(

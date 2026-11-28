@@ -147,3 +147,21 @@ def test_job_output_zip_and_telegram_auto_and_manual_send(tmp_path, monkeypatch)
         )
         assert bad_boot.status_code == 400
         assert "vps-3" not in [n["vps_id"] for n in client.get("/api/v1/vps", headers=hdr).json()["nodes"]]
+
+        # Manual job started locally on worker is registerable and auto-zips + sends to Telegram
+        r_reg = client.post(
+            "/api/v1/agent/register-job",
+            json={"job_id": "manual_999_ab", "filename": "local_combo.txt"},
+            headers={"Authorization": f"Bearer {tok}"},
+        )
+        assert r_reg.status_code == 200
+        man_buf = io.BytesIO()
+        with zipfile.ZipFile(man_buf, "w") as zf:
+            zf.writestr("hit_2fa.txt", "u3:p3|a@b.com|2026-11-28\n")
+        man_up = client.post(
+            "/api/v1/agent/output/manual_999_ab",
+            content=man_buf.getvalue(),
+            headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/zip"},
+        )
+        assert man_up.status_code == 200 and man_up.json()["tg_auto_sent"] is True
+        assert tg_calls[-1][2] == "local_combo_manual_999_ab.zip"

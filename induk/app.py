@@ -135,6 +135,11 @@ class HitsBatchBody(BaseModel):
     lines: list[str] = Field(default_factory=list)
 
 
+class RegisterJobBody(BaseModel):
+    job_id: str
+    filename: str = ""
+
+
 class VpnDistributeBody(BaseModel):
     vps_ids: list[str]
     folders: list[str] = Field(default_factory=list)
@@ -727,6 +732,21 @@ def create_app(
         await db.touch_seen(vps_id)
         return {"commands": cmds}
 
+    @app.post("/api/v1/agent/register-job")
+    async def register_agent_job(body: RegisterJobBody, vps_id: str = Depends(require_agent_auth)):
+        jid = _validate_safe_id(body.job_id, "job_id")
+        if not jid.startswith("manual_"):
+            raise HTTPException(status_code=403, detail="Only manual jobs can be registered by agents")
+        existing = await db.get_job(jid)
+        exp = (existing or {}).get("config", {}).get("vps_ids") or []
+        if exp and vps_id not in exp:
+            raise HTTPException(status_code=403, detail="Job already belongs to another VPS")
+        stem = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.splitext(body.filename or "")[0]).strip("._-")[:40]
+        await db.upsert_manual_job(jid, vps_id, stem)
+        await db.touch_seen(vps_id)
+        await hub.broadcast_ui({"type": "job_output_ready", "job_id": jid, "vps_id": vps_id, "tg_sent": False})
+        return {"ok": True, "job_id": jid}
+
     @app.post("/api/v1/agent/hits")
     async def upload_hits(body: HitsBatchBody, vps_id: str = Depends(require_agent_auth)):
         jid = _validate_safe_id(body.job_id, "job_id")
@@ -740,6 +760,9 @@ def create_app(
     async def upload_agent_output(job_id: str, request: Request, vps_id: str = Depends(require_agent_auth)):
         jid = _validate_safe_id(job_id, "job_id")
         job = await db.get_job(jid)
+        if jid.startswith("manual_") and (not job or not (job.get("config") or {}).get("vps_ids")):
+            await db.upsert_manual_job(jid, vps_id, "")
+            job = await db.get_job(jid)
         if not job:
             raise HTTPException(status_code=404, detail=f"Job not found: {jid}")
         expected = set((job.get("config") or {}).get("vps_ids") or [])
