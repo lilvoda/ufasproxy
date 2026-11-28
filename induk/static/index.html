@@ -13,10 +13,12 @@
       <strong>ufasproxy Induk</strong>
       <span class="muted" id="ws-label">Disconnected</span>
     </div>
-    <div class="auth-bar">
-      <input type="password" id="api-key-input" placeholder="X-API-Key" />
-      <button id="connect-btn">Connect</button>
-    </div>
+    <form class="auth-bar" id="auth-form">
+      <input type="text" id="auth-user" placeholder="Username" autocomplete="username" />
+      <input type="password" id="auth-pass" placeholder="Password" autocomplete="current-password" />
+      <button type="submit" id="connect-btn">Login</button>
+      <button type="button" id="logout-btn" class="hidden">Logout</button>
+    </form>
   </header>
 
   <main class="container">

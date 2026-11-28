@@ -9,6 +9,8 @@ DEFAULT_TOKEN="bN7X9l38hw-O-lL1iyBHZWPauPBc3jwM"
 DEFAULT_TG_TOKEN="8784287033:AAEyIpriTua1m4th50iBEAxggmJHJOx5vKg"
 DEFAULT_TG_CHAT_ID="8339459756"
 DEFAULT_TG_INTERVAL="15"
+DEFAULT_INDUK_USER="lilvoda"
+DEFAULT_INDUK_PASS="adminvoda@"
 
 DO_CLIENT=0
 DO_SERVER=0
@@ -19,7 +21,8 @@ ARG_TG_TOKEN="${UFASPROXY_TG_TOKEN:-}"
 ARG_TG_CHAT_ID="${UFASPROXY_TG_CHAT_ID:-}"
 ARG_TG_INTERVAL="${UFASPROXY_TG_INTERVAL:-}"
 INDUK_PORT="${INDUK_PORT:-8000}"
-ARG_INDUK_API_KEY="${INDUK_API_KEY:-}"
+ARG_INDUK_USER="${INDUK_USER:-}"
+ARG_INDUK_PASS="${INDUK_PASS:-}"
 RESTORE_BUNDLE=""
 INDUK_URL="${INDUK_URL:-}"
 AGENT_TOKEN="${AGENT_TOKEN:-}"
@@ -55,9 +58,12 @@ while [[ $# -gt 0 ]]; do
     --induk-port)
       [[ $# -ge 2 ]] || { echo "Error: --induk-port requires a value" >&2; exit 1; }
       INDUK_PORT="$2"; shift 2 ;;
-    --induk-api-key)
-      [[ $# -ge 2 ]] || { echo "Error: --induk-api-key requires a value" >&2; exit 1; }
-      ARG_INDUK_API_KEY="$2"; shift 2 ;;
+    --induk-user)
+      [[ $# -ge 2 ]] || { echo "Error: --induk-user requires a value" >&2; exit 1; }
+      ARG_INDUK_USER="$2"; shift 2 ;;
+    --induk-pass)
+      [[ $# -ge 2 ]] || { echo "Error: --induk-pass requires a value" >&2; exit 1; }
+      ARG_INDUK_PASS="$2"; shift 2 ;;
     --restore)
       [[ $# -ge 2 ]] || { echo "Error: --restore requires a value" >&2; exit 1; }
       RESTORE_BUNDLE="$2"; shift 2 ;;
@@ -74,7 +80,7 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || { echo "Error: --induk-pointer-url requires a value" >&2; exit 1; }
       INDUK_POINTER_URL="$2"; shift 2 ;;
     -h|--help)
-      echo "Usage: bash install.sh [--client] [--server] [--induk] [--all] [--url URL] [--token TOKEN] [--tg-token BOT_TOKEN] [--tg-chat-id CHAT_ID] [--tg-interval SEC] [--induk-port PORT] [--induk-api-key KEY] [--restore BUNDLE] [--induk-url URL --agent-token TOK --vps-id ID] [--roll-token] [--no-git-push] [--restart]"
+      echo "Usage: bash install.sh [--client] [--server] [--induk] [--all] [--url URL] [--token TOKEN] [--tg-token BOT_TOKEN] [--tg-chat-id CHAT_ID] [--tg-interval SEC] [--induk-port PORT] [--induk-user USER] [--induk-pass PASS] [--restore BUNDLE] [--induk-url URL --agent-token TOK --vps-id ID] [--roll-token] [--no-git-push] [--restart]"
       exit 0
       ;;
     *)
@@ -635,21 +641,29 @@ PY
     use_sudo=0
   fi
 
-  local api_key="${ARG_INDUK_API_KEY:-}"
-  if [[ -z "$api_key" ]]; then
+  local induk_user="${ARG_INDUK_USER:-}"
+  local induk_pass="${ARG_INDUK_PASS:-}"
+  if [[ -z "$induk_user" ]]; then
     if [[ "$use_sudo" -eq 1 && -f "$env_file" ]]; then
-      api_key="$($SUDO awk -F= '$1=="INDUK_API_KEY"{print substr($0,index($0,"=")+1); exit}' "$env_file" 2>/dev/null || true)"
+      induk_user="$($SUDO awk -F= '$1=="INDUK_USER"{print substr($0,index($0,"=")+1); exit}' "$env_file" 2>/dev/null || true)"
     elif [[ -f "$env_file" ]]; then
-      api_key="$(awk -F= '$1=="INDUK_API_KEY"{print substr($0,index($0,"=")+1); exit}' "$env_file" 2>/dev/null || true)"
+      induk_user="$(awk -F= '$1=="INDUK_USER"{print substr($0,index($0,"=")+1); exit}' "$env_file" 2>/dev/null || true)"
     fi
   fi
-  if [[ -z "$api_key" ]]; then
-    api_key="$("$ivpy" -c "import secrets; print(secrets.token_urlsafe(24))")"
+  [[ -n "$induk_user" ]] || induk_user="$DEFAULT_INDUK_USER"
+
+  if [[ -z "$induk_pass" ]]; then
+    if [[ "$use_sudo" -eq 1 && -f "$env_file" ]]; then
+      induk_pass="$($SUDO awk -F= '$1=="INDUK_PASS"{print substr($0,index($0,"=")+1); exit}' "$env_file" 2>/dev/null || true)"
+    elif [[ -f "$env_file" ]]; then
+      induk_pass="$(awk -F= '$1=="INDUK_PASS"{print substr($0,index($0,"=")+1); exit}' "$env_file" 2>/dev/null || true)"
+    fi
   fi
+  [[ -n "$induk_pass" ]] || induk_pass="$DEFAULT_INDUK_PASS"
 
   local env_payload
-  env_payload="$(printf 'INDUK_API_KEY=%s\nINDUK_DATA_DIR=%s\nINDUK_REPO_DIR=%s\nINDUK_PORT=%s' \
-    "$api_key" "$SCRIPT_DIR/induk_data" "$SCRIPT_DIR" "$INDUK_PORT")"
+  env_payload="$(printf 'INDUK_USER=%s\nINDUK_PASS=%s\nINDUK_DATA_DIR=%s\nINDUK_REPO_DIR=%s\nINDUK_PORT=%s' \
+    "$induk_user" "$induk_pass" "$SCRIPT_DIR/induk_data" "$SCRIPT_DIR" "$INDUK_PORT")"
   _write_secret_file "$env_file" "$env_payload" "$use_sudo"
 
   if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]] && [[ "$SUDO" != "__NEED_ROOT__" ]]; then
@@ -678,7 +692,7 @@ EOF
     echo "[OK] ufasproxy INDUK ready (systemd tidak aktif; jalankan manual):"
     echo "  set -a && source \"$env_file\" && set +a && \"$SCRIPT_DIR/.venv_induk/bin/uvicorn\" induk.app:app --host 0.0.0.0 --port $INDUK_PORT"
   fi
-  echo "INDUK env saved -> $env_file (chmod 600)"
+  echo "INDUK env saved -> $env_file (chmod 600, user=$induk_user)"
 }
 
 install_client() {

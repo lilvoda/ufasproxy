@@ -1,5 +1,6 @@
 const state = {
-  apiKey: sessionStorage.getItem("muse_api_key") || "",
+  uiToken: sessionStorage.getItem("muse_ui_token") || "",
+  username: sessionStorage.getItem("muse_ui_user") || "",
   nodes: [],
   summary: {},
   selected: new Set(),
@@ -15,11 +16,29 @@ const num = (v, d = 0) => {
 };
 
 function headers(extra = {}) {
-  return { "X-API-Key": state.apiKey, ...extra };
+  return { "X-UI-Token": state.uiToken, ...extra };
+}
+
+function setAuthUi(loggedIn) {
+  $("auth-user").classList.toggle("hidden", loggedIn);
+  $("auth-pass").classList.toggle("hidden", loggedIn);
+  $("connect-btn").classList.toggle("hidden", loggedIn);
+  $("logout-btn").classList.toggle("hidden", !loggedIn);
+  $("logout-btn").textContent = state.username ? `Logout (${state.username})` : "Logout";
+}
+
+function clearAuth(label = "Login required") {
+  state.uiToken = "";
+  sessionStorage.removeItem("muse_ui_token");
+  if (state.ws) { state.ws.close(); state.ws = null; }
+  $("ws-dot").classList.remove("on");
+  $("ws-label").textContent = label;
+  setAuthUi(false);
 }
 
 async function api(path, opts = {}) {
   const res = await fetch(path, { ...opts, headers: headers(opts.headers || {}) });
+  if (res.status === 401) clearAuth("Session expired");
   if (!res.ok) {
     const txt = await res.text();
     throw new Error(`${res.status}: ${txt}`);
@@ -200,8 +219,8 @@ async function connectWs() {
   ws.onopen = () => { $("ws-dot").classList.add("on"); $("ws-label").textContent = "Live 2-Way"; };
   ws.onclose = () => {
     $("ws-dot").classList.remove("on");
-    $("ws-label").textContent = "Reconnecting...";
-    if (state.apiKey) setTimeout(() => { if (state.ws === ws) connectWs(); }, 3000);
+    $("ws-label").textContent = state.uiToken ? "Reconnecting..." : "Disconnected";
+    if (state.uiToken) setTimeout(() => { if (state.ws === ws && state.uiToken) connectWs(); }, 3000);
   };
   ws.onmessage = (ev) => {
     const msg = JSON.parse(ev.data);
@@ -210,14 +229,33 @@ async function connectWs() {
   };
 }
 
-$("api-key-input").value = state.apiKey;
-$("connect-btn").onclick = async () => {
+$("auth-user").value = state.username;
+$("auth-form").onsubmit = async (e) => {
+  e.preventDefault();
   try {
-    state.apiKey = $("api-key-input").value.trim();
-    sessionStorage.setItem("muse_api_key", state.apiKey);
+    const username = $("auth-user").value.trim();
+    const password = $("auth-pass").value;
+    const res = await fetch("/api/v1/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password }),
+    });
+    if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
+    const data = await res.json();
+    state.uiToken = data.token;
+    state.username = data.username || username;
+    sessionStorage.setItem("muse_ui_token", state.uiToken);
+    sessionStorage.setItem("muse_ui_user", state.username);
+    $("auth-pass").value = "";
+    $("sys-msg").textContent = "";
+    setAuthUi(true);
     await loadVps();
     await connectWs();
-  } catch (e) { $("sys-msg").textContent = `Error: ${e.message}`; }
+  } catch (err) { $("sys-msg").textContent = `Login gagal: ${err.message}`; }
+};
+$("logout-btn").onclick = async () => {
+  await fetch("/api/v1/auth/logout", { method: "POST", headers: headers() }).catch(() => {});
+  clearAuth("Disconnected");
 };
 $("chk-all").onchange = (e) => {
   state.nodes.forEach((n) => (e.target.checked ? state.selected.add(n.vps_id) : state.selected.delete(n.vps_id)));
@@ -330,4 +368,5 @@ $("migrate-btn").onclick = async () => {
   } catch (e) { alert(e.message); }
 };
 
-if (state.apiKey) { loadVps().then(connectWs).catch(() => {}); }
+setAuthUi(Boolean(state.uiToken));
+if (state.uiToken) { loadVps().then(connectWs).catch(() => {}); }

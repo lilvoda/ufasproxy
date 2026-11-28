@@ -1,5 +1,32 @@
+import base64
 from fastapi.testclient import TestClient
 from induk.app import create_app
+
+
+def test_credential_login_basic_auth_and_rate_limit(tmp_path):
+    app = create_app(db_path=str(tmp_path / "cred.db"), data_dir=str(tmp_path))
+    with TestClient(app) as client:
+        # API key disabled unless explicitly configured
+        assert client.get("/api/v1/vps", headers={"X-API-Key": "anything"}).status_code == 401
+        assert client.post("/api/v1/auth/login", json={"username": "lilvoda", "password": "wrong"}).status_code == 401
+
+        res = client.post("/api/v1/auth/login", json={"username": "lilvoda", "password": "adminvoda@"})
+        assert res.status_code == 200
+        tok = res.json()["token"]
+        assert client.get("/api/v1/vps", headers={"X-UI-Token": tok}).status_code == 200
+
+        # HTTP Basic Auth works directly too
+        b64 = base64.b64encode(b"lilvoda:adminvoda@").decode("ascii")
+        assert client.get("/api/v1/vps", headers={"Authorization": f"Basic {b64}"}).status_code == 200
+
+        # Logout revokes session token
+        assert client.post("/api/v1/auth/logout", headers={"X-UI-Token": tok}).status_code == 200
+        assert client.get("/api/v1/vps", headers={"X-UI-Token": tok}).status_code == 401
+
+        # Rate limiter triggers 429 after 10 failures (1 revoked-token fail above + 9 bad logins)
+        for _ in range(9):
+            assert client.post("/api/v1/auth/login", json={"username": "lilvoda", "password": "bad"}).status_code == 401
+        assert client.post("/api/v1/auth/login", json={"username": "lilvoda", "password": "bad"}).status_code == 429
 
 
 def test_auth_rate_limit(tmp_path):

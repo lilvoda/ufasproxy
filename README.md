@@ -20,7 +20,7 @@ sudo python3 server.py --ovpn-dir /path/to/vpns-surfshark --udp-only --port 8080
 Bisa dipasang di VPS terpisah **atau** di VPS yang sama dengan Gateway VPN (`--server --induk` memakai service & port berbeda: `:8000` vs `:8080`):
 ```bash
 sudo bash install.sh --induk --induk-port 8000
-# Buka Web UI Dashboard di http://<INDUK_IP>:8000 (API key ada di /etc/ufasproxy-induk/env)
+# Buka Web UI Dashboard di http://<INDUK_IP>:8000 (login dengan username/password di /etc/ufasproxy-induk/env)
 ```
 
 ### 3. Client Checker (`old_browser_vpn.py` & Opsional Agent Induk di CT / Worker)

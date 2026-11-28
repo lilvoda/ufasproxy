@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextlib
 import hmac
 import os
@@ -252,6 +254,11 @@ class MigrateIndukBody(BaseModel):
     vps_ids: list[str] = Field(default_factory=list)
 
 
+class LoginBody(BaseModel):
+    username: str = ""
+    password: str = ""
+
+
 def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
@@ -270,11 +277,15 @@ def create_app(
     api_key: str | None = None,
     data_dir: str | None = None,
     repo_dir: str | None = None,
+    username: str | None = None,
+    password: str | None = None,
 ) -> FastAPI:
     base_data = os.path.abspath(data_dir or os.environ.get("INDUK_DATA_DIR", "induk_data"))
     resolved_db = db_path or os.environ.get("INDUK_DB_PATH") or os.path.join(base_data, "induk.db")
     resolved_repo = os.path.abspath(repo_dir or os.environ.get("INDUK_REPO_DIR", os.getcwd()))
-    resolved_key = api_key or os.environ.get("INDUK_API_KEY") or secrets.token_urlsafe(24)
+    resolved_user = username if username is not None else (os.environ.get("INDUK_USER") or "lilvoda")
+    resolved_pass = password if password is not None else (os.environ.get("INDUK_PASS") or "adminvoda@")
+    resolved_key = api_key if api_key is not None else os.environ.get("INDUK_API_KEY", "")
     offline_s = float(os.environ.get("INDUK_OFFLINE_S", "20.0"))
     stall_s = float(os.environ.get("INDUK_STALL_S", "180.0"))
 
@@ -283,6 +294,7 @@ def create_app(
     limiter = _RateLimiter()
     agent_limiter = _RateLimiter()
     ws_tickets: dict[str, float] = {}
+    ui_sessions: dict[str, float] = {}
     ssh_tasks: set[asyncio.Task[None]] = set()
 
     @asynccontextmanager
@@ -305,16 +317,46 @@ def create_app(
     app.state.data_dir = base_data
     app.state.repo_dir = resolved_repo
     app.state.api_key = resolved_key
+    app.state.username = resolved_user
+
+    def _verify_credentials(user: str, pw: str) -> bool:
+        if not (resolved_user and resolved_pass):
+            return False
+        u_ok = hmac.compare_digest(user.encode("utf-8"), resolved_user.encode("utf-8"))
+        p_ok = hmac.compare_digest(pw.encode("utf-8"), resolved_pass.encode("utf-8"))
+        return bool(u_ok & p_ok)
+
+    def _basic_auth_ok(auth_header: str | None) -> bool:
+        if not auth_header:
+            return False
+        parts = auth_header.split(None, 1)
+        if len(parts) != 2 or parts[0].lower() != "basic":
+            return False
+        try:
+            decoded = base64.b64decode(parts[1].strip(), validate=True).decode("utf-8")
+        except (binascii.Error, UnicodeDecodeError):
+            return False
+        if ":" not in decoded:
+            return False
+        u, p = decoded.split(":", 1)
+        return _verify_credentials(u, p)
 
     async def require_ui_auth(
         request: Request,
         x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+        x_ui_token: str | None = Header(default=None, alias="X-UI-Token"),
+        authorization: str | None = Header(default=None, alias="Authorization"),
     ) -> None:
         ip = _client_ip(request)
         limiter.check(ip)
-        if not x_api_key or not hmac.compare_digest(x_api_key, resolved_key):
+        now = time.monotonic()
+        tok = x_ui_token or _bearer_token(authorization)
+        tok_ok = bool(tok and ui_sessions.get(tok, 0.0) > now)
+        key_ok = bool(resolved_key and x_api_key and hmac.compare_digest(x_api_key, resolved_key))
+        basic_ok = _basic_auth_ok(authorization)
+        if not (tok_ok or key_ok or basic_ok):
             limiter.record_fail(ip)
-            raise HTTPException(status_code=401, detail="Invalid API key")
+            raise HTTPException(status_code=401, detail="Invalid credentials")
         limiter.reset(ip)
 
     async def require_agent_auth(
@@ -346,6 +388,33 @@ def create_app(
     async def health():
         wal = await db.wal_mode()
         return {"ok": True, "db": wal.lower(), "agents_online": len(hub.agent_sockets)}
+
+    @app.post("/api/v1/auth/login")
+    async def ui_login(body: LoginBody, request: Request):
+        ip = _client_ip(request)
+        limiter.check(ip)
+        if not _verify_credentials(body.username.strip(), body.password):
+            limiter.record_fail(ip)
+            raise HTTPException(status_code=401, detail="Invalid username or password")
+        limiter.reset(ip)
+        now = time.monotonic()
+        for k in [k for k, exp in ui_sessions.items() if exp <= now]:
+            ui_sessions.pop(k, None)
+        if len(ui_sessions) >= 128:
+            ui_sessions.pop(next(iter(ui_sessions)), None)
+        tok = secrets.token_urlsafe(32)
+        ui_sessions[tok] = now + 86400.0
+        return {"ok": True, "token": tok, "username": resolved_user}
+
+    @app.post("/api/v1/auth/logout")
+    async def ui_logout(
+        x_ui_token: str | None = Header(default=None, alias="X-UI-Token"),
+        authorization: str | None = Header(default=None, alias="Authorization"),
+    ):
+        tok = x_ui_token or _bearer_token(authorization)
+        if tok:
+            ui_sessions.pop(tok, None)
+        return {"ok": True}
 
     @app.post("/api/v1/ui/ws-ticket", dependencies=[Depends(require_ui_auth)])
     async def issue_ws_ticket():
@@ -728,7 +797,7 @@ def create_app(
         ticket = ws.query_params.get("ticket", "")
         key = ws.headers.get("x-api-key") or ws.query_params.get("api_key", "")
         ticket_ok = bool(ticket and ws_tickets.pop(ticket, 0.0) > time.monotonic())
-        key_ok = bool(key and hmac.compare_digest(key, resolved_key))
+        key_ok = bool(resolved_key and key and hmac.compare_digest(key, resolved_key))
         if not (ticket_ok or key_ok):
             limiter.record_fail(ip)
             await ws.close(code=4401)
