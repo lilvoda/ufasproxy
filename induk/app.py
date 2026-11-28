@@ -1253,17 +1253,11 @@ def create_app(
                 sent = os.path.isfile(os.path.join(jdir, ".tg_sent"))
                 return done, sent
 
-            done_vps, already_sent = await asyncio.to_thread(_save_and_check)
+            done_vps, _ = await asyncio.to_thread(_save_and_check)
             await db.touch_seen(vps_id)
 
-            tg_auto_sent = False
-            if not partial and expected and expected.issubset(done_vps) and resolved_tg_tok and resolved_tg_chat and not already_sent:
-                with contextlib.suppress(Exception):
-                    await _dispatch_job_tg_zip(jid)
-                    tg_auto_sent = True
-
-        await hub.broadcast_ui({"type": "job_output_ready", "job_id": jid, "vps_id": vps_id, "tg_sent": tg_auto_sent})
-        return {"ok": True, "job_id": jid, "tg_auto_sent": tg_auto_sent}
+        await hub.broadcast_ui({"type": "job_output_ready", "job_id": jid, "vps_id": vps_id, "tg_sent": False})
+        return {"ok": True, "job_id": jid, "tg_auto_sent": False}
 
     @app.get("/api/v1/vpn/pool", dependencies=[Depends(require_ui_auth)])
     async def get_vpn_pool():

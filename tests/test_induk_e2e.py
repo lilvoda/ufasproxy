@@ -103,7 +103,7 @@ def test_job_output_zip_and_telegram_auto_and_manual_send(tmp_path, monkeypatch)
             == 400
         )
 
-        # Valid output zip triggers auto Telegram sendDocument once all expected VPS upload
+        # Valid output zip NEVER auto-sends Telegram; only manual /telegram endpoint sends
         ok_buf = io.BytesIO()
         with zipfile.ZipFile(ok_buf, "w") as zf:
             zf.writestr("hit_valid.txt", "u1:p1|tok|1|Hero|2026-11-28 00:00:00\n")
@@ -113,8 +113,8 @@ def test_job_output_zip_and_telegram_auto_and_manual_send(tmp_path, monkeypatch)
             content=ok_buf.getvalue(),
             headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/zip"},
         )
-        assert up.status_code == 200 and up.json()["tg_auto_sent"] is True
-        assert len(tg_calls) == 1 and tg_calls[0][2] == f"koi_batch_{job_id}.zip"
+        assert up.status_code == 200 and up.json()["tg_auto_sent"] is False
+        assert len(tg_calls) == 0
 
         # Download zip returns merged results + summary.txt
         zres = client.get(f"/api/v1/results/{job_id}/zip", headers=hdr)
@@ -124,9 +124,9 @@ def test_job_output_zip_and_telegram_auto_and_manual_send(tmp_path, monkeypatch)
             assert {"summary.txt", "hit_valid.txt", "invalid.txt"}.issubset(names)
             assert "u1:p1|tok" in zf.read("hit_valid.txt").decode("utf-8")
 
-        # Manual Telegram resend works & job list reflects tg_sent
+        # Manual Telegram send works & job list reflects tg_sent
         assert client.post(f"/api/v1/results/{job_id}/telegram", headers=hdr).status_code == 200
-        assert len(tg_calls) == 2
+        assert len(tg_calls) == 1 and tg_calls[0][2] == f"koi_batch_{job_id}.zip"
         jobs = client.get("/api/v1/jobs", headers=hdr).json()["jobs"]
         assert jobs[0]["job_id"] == job_id and jobs[0]["tg_sent"] is True and jobs[0]["filename"] == "koi_batch"
 
@@ -165,8 +165,8 @@ def test_job_output_zip_and_telegram_auto_and_manual_send(tmp_path, monkeypatch)
             content=man_buf.getvalue(),
             headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/zip"},
         )
-        assert man_up.status_code == 200 and man_up.json()["tg_auto_sent"] is True
-        assert tg_calls[-1][2] == "local_combo_manual_999_ab.zip"
+        assert man_up.status_code == 200 and man_up.json()["tg_auto_sent"] is False
+        assert len(tg_calls) == 1  # manual upload never auto-sends Telegram
 
         # Combined checked-VPS output merges both vps-1 & vps-2 into ONE zip + Telegram send
         client.post(
@@ -244,8 +244,8 @@ def test_job_output_zip_and_telegram_auto_and_manual_send(tmp_path, monkeypatch)
             content=pbuf.getvalue(),
             headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/zip"},
         )
-        assert fin_res.status_code == 200 and fin_res.json()["tg_auto_sent"] is True
-        assert len(tg_calls) == prev_tg + 1
+        assert fin_res.status_code == 200 and fin_res.json()["tg_auto_sent"] is False
+        assert len(tg_calls) == prev_tg
 
         dl_full = client.get("/api/v1/results/manual_full_1/zip", headers=hdr)
         with zipfile.ZipFile(io.BytesIO(dl_full.content), "r") as zf:
