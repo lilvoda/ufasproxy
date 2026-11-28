@@ -6,8 +6,9 @@ const state = {
   summary: {},
   selected: new Set(),
   comboFilename: "",
-  activeTier: "",
-  collectorData: { tiers: [], items: [], total_cards: 0, total_matched: 0, truncated: false },
+  logStream: [],
+  logSeen: new Map(),
+  tierData: { tiers: [], total_cards: 0 },
   ws: null,
 };
 
@@ -68,6 +69,45 @@ function checkedIds() {
 const _HIDE_LOG_RE = /\b(?:rotat(?:e|ed|ing|i|asi)|openvpn|ovpn|ganti\s+vpn|vpn\b|api\s*slot|lease\b.*ufasproxy|ufasproxy\s+lease|smart\b|sistem\s+pintar|aimd|bottleneck|node\s*score)\b|\b(?:DROP\s+-?\d+%|Scale\s+[+-]\d+)/i;
 const _ANSI_RE = /\x1b\[[0-9;]*m/g;
 
+function _diffTail(prev, cur) {
+  const maxK = Math.min(prev.length, cur.length);
+  for (let k = maxK; k > 0; k -= 1) {
+    let ok = true;
+    for (let i = 0; i < k; i += 1) {
+      if (prev[prev.length - k + i] !== cur[i]) { ok = false; break; }
+    }
+    if (ok) return cur.slice(k);
+  }
+  return cur;
+}
+
+function syncLogStream() {
+  const seedQueue = [];
+  for (const n of state.nodes) {
+    const clean = ((n.telemetry && n.telemetry.log_tail) || [])
+      .map((raw) => String(raw || "").replace(_ANSI_RE, "").trim())
+      .filter((s) => s && !_HIDE_LOG_RE.test(s));
+    const prev = state.logSeen.get(n.vps_id);
+    if (!prev) {
+      seedQueue.push({ vid: n.vps_id, lines: clean });
+    } else {
+      for (const ln of _diffTail(prev, clean)) {
+        state.logStream.push({ vid: n.vps_id, text: ln });
+      }
+    }
+    state.logSeen.set(n.vps_id, clean);
+  }
+  if (seedQueue.length) {
+    const maxLen = Math.max(...seedQueue.map((q) => q.lines.length));
+    for (let i = 0; i < maxLen; i += 1) {
+      for (const q of seedQueue) {
+        if (i < q.lines.length) state.logStream.push({ vid: q.vid, text: q.lines[i] });
+      }
+    }
+  }
+  if (state.logStream.length > 300) state.logStream = state.logStream.slice(-300);
+}
+
 function renderLiveLogs() {
   const ids = checkedIds();
   const hint = $("live-log-hint");
@@ -77,19 +117,14 @@ function renderLiveLogs() {
     logBox.textContent = "";
     return;
   }
-  hint.textContent = `${ids.length} VPS tercentang`;
-  const lines = [];
-  for (const vid of ids) {
-    const node = state.nodes.find((n) => n.vps_id === vid);
-    const tail = ((node && node.telemetry && node.telemetry.log_tail) || []);
-    for (const raw of tail) {
-      const clean = String(raw || "").replace(_ANSI_RE, "").trim();
-      if (!clean || _HIDE_LOG_RE.test(clean)) continue;
-      lines.push(`[${vid}] ${clean}`);
-    }
-  }
+  const allow = new Set(ids);
+  hint.textContent = `${ids.length} VPS tercentang (${ids.join(", ")})`;
+  const lines = state.logStream
+    .filter((entry) => allow.has(entry.vid))
+    .slice(-150)
+    .map((entry) => `[${entry.vid}] ${entry.text}`);
   const atBottom = (logBox.scrollHeight - logBox.scrollTop - logBox.clientHeight) < 24;
-  logBox.textContent = lines.slice(-150).join("\n");
+  logBox.textContent = lines.join("\n");
   if (atBottom) logBox.scrollTop = logBox.scrollHeight;
 }
 
@@ -147,6 +182,7 @@ function renderAll() {
   document.querySelectorAll(".del-vps-btn").forEach((el) => {
     el.onclick = () => window.delVps(el.dataset.id);
   });
+  syncLogStream();
   renderLiveLogs();
   updateOutNote();
   const chkAll = $("chk-all");
@@ -158,63 +194,20 @@ function renderAll() {
   }
 }
 
-function activeTierList() {
-  const chk = $("zip-filter-tier");
-  return chk && chk.checked && state.activeTier ? [state.activeTier] : [];
-}
-
 function updateOutNote() {
   const ids = checkedIds();
-  const tl = activeTierList();
-  const tierTxt = tl.length ? ` [Tier: ${tl[0].replace(/^\d+_|\.txt$/g, "").replace(/_/g, " ")}]` : "";
-  $("out-scope-note").textContent = (ids.length
+  $("out-scope-note").textContent = ids.length
     ? `Target output.zip: ${ids.length} VPS tercentang (${ids.join(", ")}) — semua folder di output/`
-    : "Target output.zip: Semua VPS terdaftar — semua folder di output/") + tierTxt;
+    : "Target output.zip: Semua VPS terdaftar — semua folder di output/";
 }
 
-function renderCollectors() {
-  const d = state.collectorData || {};
+function renderTierCounts() {
+  const d = state.tierData || {};
   const tiers = d.tiers || [];
-  const bar = $("col-tier-bar");
-  const allBtn = `<button class="pill ${!state.activeTier ? "active" : ""}" data-tier="">Semua (${num(d.total_cards)})</button>`;
-  bar.innerHTML = allBtn + tiers.map((t) =>
-    `<button class="pill ${state.activeTier === t.key ? "active" : ""}" data-tier="${esc(t.key)}">${esc(t.label)} (${num(t.count)})</button>`
+  $("tier-total-note").textContent = `Total Full Info: ${num(d.total_cards).toLocaleString()}`;
+  $("tier-kpis").innerHTML = tiers.map((t) =>
+    `<div class="kpi"><span class="k-lbl">${esc(t.label)}</span><strong>${num(t.count).toLocaleString()}</strong></div>`
   ).join("");
-  bar.querySelectorAll(".pill").forEach((el) => {
-    el.onclick = () => {
-      state.activeTier = el.dataset.tier || "";
-      updateOutNote();
-      loadCollectors();
-    };
-  });
-
-  const q = ($("col-search").value || "").trim().toLowerCase();
-  const rows = (d.items || []).filter((it) => {
-    if (!q) return true;
-    return [it.folder, it.account, it.collector, it.rank, it.skin, it.status].some((v) => String(v || "").toLowerCase().includes(q));
-  });
-  $("col-summary-note").textContent = `Menampilkan ${rows.length} dari ${num(d.total_matched)} akun` + (d.truncated ? " (maks 500 pratinjau)" : "");
-  $("col-tbody").innerHTML = rows.map((it, idx) => `<tr>
-    <td>${esc(it.folder)}</td>
-    <td><code>${esc(it.account || "-")}</code></td>
-    <td>${esc(it.collector || it.tier_label)}</td>
-    <td>${esc(it.rank || "-")}</td>
-    <td>${esc(it.hero || "-")} · ${esc(it.skin || "-")} · 💎 ${esc(it.diamond || "0")}</td>
-    <td>${esc(it.status || "-")}</td>
-    <td>
-      <button class="copy-upas-btn" data-idx="${idx}">Copy</button>
-      <details style="display:inline-block"><summary class="muted" style="cursor:pointer">Detail</summary><pre class="card-pre">${esc(it.card)}</pre></details>
-    </td>
-  </tr>`).join("") || '<tr><td colspan="7" class="muted">Belum ada data full_info collector.</td></tr>';
-
-  $("col-tbody").querySelectorAll(".copy-upas-btn").forEach((el) => {
-    el.onclick = () => {
-      const item = rows[Number(el.dataset.idx)];
-      if (item && navigator.clipboard) navigator.clipboard.writeText(item.account || item.card || "");
-      el.textContent = "Copied ✓";
-      setTimeout(() => { el.textContent = "Copy"; }, 1200);
-    };
-  });
 }
 
 async function loadCollectors() {
@@ -223,10 +216,10 @@ async function loadCollectors() {
     const res = await api("/api/v1/results/collectors", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ vps_ids: checkedIds(), tiers: state.activeTier ? [state.activeTier] : [] }),
+      body: JSON.stringify({ vps_ids: checkedIds() }),
     });
-    state.collectorData = res;
-    renderCollectors();
+    state.tierData = res;
+    renderTierCounts();
   } catch (_) {}
 }
 
@@ -338,10 +331,6 @@ $("chk-all").onchange = (e) => {
   loadCollectors();
 };
 
-$("zip-filter-tier").onchange = () => updateOutNote();
-$("col-search").oninput = () => renderCollectors();
-$("col-refresh-btn").onclick = () => loadCollectors();
-
 $("combo-file").onchange = async (e) => {
   const f = e.target.files[0];
   if (!f) return;
@@ -426,7 +415,7 @@ $("download-zip-btn").onclick = async () => {
     const res = await fetch("/api/v1/results/output.zip", {
       method: "POST",
       headers: headers({ "Content-Type": "application/json" }),
-      body: JSON.stringify({ vps_ids: checkedIds(), tiers: activeTierList() }),
+      body: JSON.stringify({ vps_ids: checkedIds() }),
     });
     if (res.status === 401) clearAuth("Session expired");
     if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
@@ -448,7 +437,7 @@ $("send-tg-btn").onclick = async () => {
     const res = await api("/api/v1/results/output-zip/telegram", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ vps_ids: checkedIds(), tiers: activeTierList() }),
+      body: JSON.stringify({ vps_ids: checkedIds() }),
     });
     if (!res.ok) throw new Error("Telegram API gagal");
     $("sys-msg").textContent = `output.zip (${res.counts.folders} folder) terkirim ke Telegram ✓`;
@@ -485,3 +474,4 @@ $("restore-btn").onclick = async () => {
 
 setAuthUi(Boolean(state.uiToken));
 if (state.uiToken) { loadVps().then(connectWs).catch(() => {}); }
+setInterval(() => { if (state.uiToken) loadCollectors(); }, 15000);

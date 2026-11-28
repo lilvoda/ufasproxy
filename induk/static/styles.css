@@ -38,9 +38,9 @@ textarea { width: 100%; font-family: monospace; font-size: 12px; }
 button { cursor: pointer; }
 button:hover { border-color: var(--accent); }
 button.primary { background: #0284c7; border-color: #0284c7; color: #fff; font-weight: 600; }
-.tab.active, .pill.active { background: #0284c7; border-color: #0284c7; color: #fff; }
-.pill { padding: 4px 10px; border-radius: 99px; font-size: 12px; }
-.card-pre { margin: 6px 0 0; padding: 8px; background: #020617; border: 1px solid var(--border); border-radius: 6px; font-size: 11px; white-space: pre-wrap; max-width: 520px; }
+.tab.active { background: #0284c7; border-color: #0284c7; color: #fff; }
+.tier-kpis { grid-template-columns: repeat(auto-fit, minmax(125px, 1fr)); }
+.tier-kpis .kpi strong { font-size: 15px; }
 .badge { padding: 2px 7px; border-radius: 99px; font-size: 11px; font-weight: 600; background: #334155; }
 .badge.RUNNING, .badge.HEALTHY { background: #14532d; color: var(--ok); }
 .badge.IDLE, .badge.ONLINE { background: #1e3a8a; color: #93c5fd; }
