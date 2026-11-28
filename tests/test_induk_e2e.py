@@ -165,3 +165,42 @@ def test_job_output_zip_and_telegram_auto_and_manual_send(tmp_path, monkeypatch)
         )
         assert man_up.status_code == 200 and man_up.json()["tg_auto_sent"] is True
         assert tg_calls[-1][2] == "local_combo_manual_999_ab.zip"
+
+        # Combined checked-VPS output merges both vps-1 & vps-2 into ONE zip + Telegram send
+        client.post(
+            "/api/v1/agent/register-job",
+            json={"job_id": "manual_888_cd", "filename": "other.txt"},
+            headers={"Authorization": f"Bearer {tok2}"},
+        )
+        buf2 = io.BytesIO()
+        with zipfile.ZipFile(buf2, "w") as zf:
+            zf.writestr("hit_valid.txt", "u9:p9|tok|9|Mage|2026-11-28\n")
+            zf.writestr("err.txt", "u0:p0|Timeout|2026-11-28\n")
+        assert (
+            client.post(
+                "/api/v1/agent/output/manual_888_cd",
+                content=buf2.getvalue(),
+                headers={"Authorization": f"Bearer {tok2}", "Content-Type": "application/zip"},
+            ).status_code
+            == 200
+        )
+
+        comb_res = client.post(
+            "/api/v1/results/checked/zip",
+            json={"vps_ids": ["vps-1", "vps-2"], "scope": "all"},
+            headers=hdr,
+        )
+        assert comb_res.status_code == 200
+        with zipfile.ZipFile(io.BytesIO(comb_res.content), "r") as zf:
+            names = set(zf.namelist())
+            assert {"summary.txt", "hit_valid.txt", "hit_2fa.txt", "invalid.txt", "err.txt"}.issubset(names)
+            assert "u1:p1|tok" in zf.read("hit_valid.txt").decode("utf-8")
+            assert "u9:p9|tok" in zf.read("hit_valid.txt").decode("utf-8")
+            assert "u3:p3" in zf.read("hit_2fa.txt").decode("utf-8")
+
+        tg_comb = client.post(
+            "/api/v1/results/checked/telegram",
+            json={"vps_ids": ["vps-1", "vps-2"], "scope": "latest"},
+            headers=hdr,
+        )
+        assert tg_comb.status_code == 200 and "vps-1_vps-2" in tg_comb.json()["zip_name"]

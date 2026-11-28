@@ -149,16 +149,17 @@ function renderAll() {
 function renderJobs() {
   const sel = $("res-job-select");
   const prev = sel.value;
-  if (!state.jobs.length) {
-    sel.innerHTML = `<option value="">(Belum ada output job)</option>`;
-    return;
-  }
-  sel.innerHTML = state.jobs.map((j) => {
-    const lbl = j.filename ? `${j.filename} (${j.job_id})` : j.job_id;
-    const tg = j.tg_sent ? " · TG✓" : "";
-    return `<option value="${esc(j.job_id)}">${esc(lbl)} · V:${num(j.valid_count)} 2FA:${num(j.otp_count)}${tg}</option>`;
-  }).join("");
-  if (prev && state.jobs.some((j) => j.job_id === prev)) sel.value = prev;
+  const opts = [
+    `<option value="__checked_latest__">Gabungan Semua VPS Tercentang (Run Terbaru/Aktif)</option>`,
+    `<option value="__checked_all__">Gabungan Semua VPS Tercentang (Semua Riwayat)</option>`,
+    ...state.jobs.map((j) => {
+      const lbl = j.filename ? `${j.filename} (${j.job_id})` : j.job_id;
+      const tg = j.tg_sent ? " · TG✓" : "";
+      return `<option value="${esc(j.job_id)}">${esc(lbl)} · V:${num(j.valid_count)} 2FA:${num(j.otp_count)}${tg}</option>`;
+    }),
+  ];
+  sel.innerHTML = opts.join("");
+  if (prev && [...sel.options].some((o) => o.value === prev)) sel.value = prev;
 }
 
 window.delVps = async (vid) => {
@@ -323,9 +324,22 @@ $("refresh-jobs-btn").onclick = loadJobs;
 
 $("download-zip-btn").onclick = async () => {
   try {
-    const jid = $("res-job-select").value;
-    if (!jid) return alert("Belum ada output job.");
-    const res = await fetch(`/api/v1/results/${encodeURIComponent(jid)}/zip`, { headers: headers() });
+    const selVal = $("res-job-select").value || "__checked_latest__";
+    let res;
+    let fallbackName = `${selVal}.zip`;
+    if (selVal === "__checked_latest__" || selVal === "__checked_all__") {
+      const vps_ids = checkedIds();
+      if (!vps_ids.length) return alert("Centang minimal 1 VPS.");
+      const scope = selVal === "__checked_all__" ? "all" : "latest";
+      fallbackName = `output_${vps_ids.length}vps.zip`;
+      res = await fetch("/api/v1/results/checked/zip", {
+        method: "POST",
+        headers: headers({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ vps_ids, scope }),
+      });
+    } else {
+      res = await fetch(`/api/v1/results/${encodeURIComponent(selVal)}/zip`, { headers: headers() });
+    }
     if (res.status === 401) clearAuth("Session expired");
     if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
     const blob = await res.blob();
@@ -334,7 +348,7 @@ $("download-zip-btn").onclick = async () => {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = (m && m[1]) ? m[1] : `${jid}.zip`;
+    a.download = (m && m[1]) ? m[1] : fallbackName;
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   } catch (e) { alert(e.message); }
@@ -342,9 +356,20 @@ $("download-zip-btn").onclick = async () => {
 
 $("send-tg-btn").onclick = async () => {
   try {
-    const jid = $("res-job-select").value;
-    if (!jid) return alert("Belum ada output job.");
-    const res = await api(`/api/v1/results/${encodeURIComponent(jid)}/telegram`, { method: "POST" });
+    const selVal = $("res-job-select").value || "__checked_latest__";
+    let res;
+    if (selVal === "__checked_latest__" || selVal === "__checked_all__") {
+      const vps_ids = checkedIds();
+      if (!vps_ids.length) return alert("Centang minimal 1 VPS.");
+      const scope = selVal === "__checked_all__" ? "all" : "latest";
+      res = await api("/api/v1/results/checked/telegram", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ vps_ids, scope }),
+      });
+    } else {
+      res = await api(`/api/v1/results/${encodeURIComponent(selVal)}/telegram`, { method: "POST" });
+    }
     if (!res.ok) throw new Error("Telegram API gagal");
     $("sys-msg").textContent = `Zip ${res.zip_name} terkirim ke Telegram ✓`;
     await loadJobs();

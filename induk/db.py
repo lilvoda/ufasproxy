@@ -583,6 +583,32 @@ class IndukDB:
         async with self._lock:
             return await asyncio.to_thread(_op)
 
+    async def export_hits_for_vps(
+        self, vps_ids: list[str], hit_type: str = "VALID", job_ids: list[str] | None = None
+    ) -> list[dict]:
+        ht = hit_type.upper()
+        if not vps_ids or (job_ids is not None and not job_ids):
+            return []
+
+        def _op() -> list[dict]:
+            conn = self._ensure_conn()
+            vp = ",".join("?" for _ in vps_ids)
+            if job_ids:
+                jp = ",".join("?" for _ in job_ids)
+                rows = conn.execute(
+                    f"SELECT account_key, raw_line, vps_id, job_id, created_at FROM hits WHERE hit_type = ? AND vps_id IN ({vp}) AND job_id IN ({jp}) ORDER BY created_at ASC",
+                    [ht, *vps_ids, *job_ids],
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    f"SELECT account_key, raw_line, vps_id, job_id, created_at FROM hits WHERE hit_type = ? AND vps_id IN ({vp}) ORDER BY created_at ASC",
+                    [ht, *vps_ids],
+                ).fetchall()
+            return [dict(r) for r in rows]
+
+        async with self._lock:
+            return await asyncio.to_thread(_op)
+
     async def backup_to(self, dest_path: str) -> None:
         def _op() -> None:
             src = self._ensure_conn()

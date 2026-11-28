@@ -132,7 +132,10 @@
           <button id="refresh-jobs-btn">Refresh</button>
         </div>
         <div class="row">
-          <select id="res-job-select"></select>
+          <select id="res-job-select">
+            <option value="__checked_latest__">Gabungan Semua VPS Tercentang (Run Terbaru/Aktif)</option>
+            <option value="__checked_all__">Gabungan Semua VPS Tercentang (Semua Riwayat)</option>
+          </select>
         </div>
         <div class="row">
           <button class="primary" id="download-zip-btn">Download .zip</button>
@@ -149,6 +152,6 @@
     </section>
   </main>
 
-  <script src="/static/app.js?v=2"></script>
+  <script src="/static/app.js?v=3"></script>
 </body>
 </html>

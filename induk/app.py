@@ -141,6 +141,11 @@ class RegisterJobBody(BaseModel):
     filename: str = ""
 
 
+class CheckedResultsBody(BaseModel):
+    vps_ids: list[str]
+    scope: str = "latest"  # "latest" | "all"
+
+
 class VpnDistributeBody(BaseModel):
     vps_ids: list[str]
     folders: list[str] = Field(default_factory=list)
@@ -617,6 +622,65 @@ def create_app(
         await asyncio.to_thread(_annotate)
         return {"jobs": jobs, "tg_configured": bool(resolved_tg_tok and resolved_tg_chat)}
 
+    def _assemble_result_zip_sync(
+        zip_name: str,
+        summary_lines: list[str],
+        valid_rows: list[dict],
+        otp_rows: list[dict],
+        zip_paths: list[str],
+    ) -> tuple[str, bytes, dict]:
+        merged: dict[str, list[str]] = {fn: [] for fn in _OUTPUT_RESULT_FILES}
+        seen_valid: set[str] = set()
+        seen_otp: set[str] = set()
+        for row in valid_rows:
+            ln = row["raw_line"].strip()
+            if ln and ln not in seen_valid:
+                seen_valid.add(ln)
+                merged["hit_valid.txt"].append(ln)
+        for row in otp_rows:
+            ln = row["raw_line"].strip()
+            if ln and ln not in seen_otp:
+                seen_otp.add(ln)
+                merged["hit_2fa.txt"].append(ln)
+
+        for zpath in zip_paths:
+            if not os.path.isfile(zpath):
+                continue
+            try:
+                with open(zpath, "rb") as f:
+                    parsed = _validate_and_read_output_zip(f.read())
+                for base_name, lines in parsed.items():
+                    for s in lines:
+                        if base_name == "hit_valid.txt":
+                            if s in seen_valid:
+                                continue
+                            seen_valid.add(s)
+                        elif base_name == "hit_2fa.txt":
+                            if s in seen_otp:
+                                continue
+                            seen_otp.add(s)
+                        merged[base_name].append(s)
+            except Exception:
+                continue
+
+        counts = {fn: len(lines) for fn, lines in merged.items()}
+        summary_txt = "\n".join(
+            [
+                *summary_lines,
+                f"Valid    : {counts['hit_valid.txt']}",
+                f"2FA/OTP  : {counts['hit_2fa.txt']}",
+                f"Invalid  : {counts['invalid.txt']}",
+                f"Error    : {counts['err.txt']}",
+            ]
+        ) + "\n"
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("summary.txt", summary_txt.encode("utf-8"))
+            for fn in _OUTPUT_RESULT_FILES:
+                if merged[fn]:
+                    zf.writestr(fn, ("\n".join(merged[fn]) + "\n").encode("utf-8"))
+        return zip_name, buf.getvalue(), counts
+
     async def _build_job_zip(job_id: str) -> tuple[str, bytes, dict]:
         job = await db.get_job(job_id)
         if not job:
@@ -624,73 +688,101 @@ def create_app(
         valid_rows = await db.export_hits(job_id, hit_type="VALID", dedup="per_job")
         otp_rows = await db.export_hits(job_id, hit_type="OTP", dedup="per_job")
 
-        def _assemble() -> tuple[str, bytes, dict]:
-            merged: dict[str, list[str]] = {fn: [] for fn in _OUTPUT_RESULT_FILES}
-            seen_valid: set[str] = set()
-            seen_otp: set[str] = set()
-            for row in valid_rows:
-                ln = row["raw_line"].strip()
-                if ln and ln not in seen_valid:
-                    seen_valid.add(ln)
-                    merged["hit_valid.txt"].append(ln)
-            for row in otp_rows:
-                ln = row["raw_line"].strip()
-                if ln and ln not in seen_otp:
-                    seen_otp.add(ln)
-                    merged["hit_2fa.txt"].append(ln)
-
+        def _prep() -> tuple[str, bytes, dict]:
             out_dir = os.path.join(base_data, "jobs", job_id, "outputs")
-            if os.path.isdir(out_dir):
-                for fn in sorted(os.listdir(out_dir)):
-                    if not fn.endswith(".zip"):
-                        continue
-                    zpath = os.path.join(out_dir, fn)
-                    try:
-                        with open(zpath, "rb") as f:
-                            parsed = _validate_and_read_output_zip(f.read())
-                        for base_name, lines in parsed.items():
-                            for s in lines:
-                                if base_name == "hit_valid.txt":
-                                    if s in seen_valid:
-                                        continue
-                                    seen_valid.add(s)
-                                elif base_name == "hit_2fa.txt":
-                                    if s in seen_otp:
-                                        continue
-                                    seen_otp.add(s)
-                                merged[base_name].append(s)
-                    except Exception:
-                        continue
-
+            zpaths = (
+                [os.path.join(out_dir, fn) for fn in sorted(os.listdir(out_dir)) if fn.endswith(".zip")]
+                if os.path.isdir(out_dir)
+                else []
+            )
             cfg = job.get("config") or {}
             stem = re.sub(r"[^A-Za-z0-9._-]+", "_", str(cfg.get("filename") or "").strip()).strip("._-")
             zip_name = f"{stem}_{job_id}.zip" if stem else f"{job_id}.zip"
-            counts = {fn: len(lines) for fn, lines in merged.items()}
-            summary_txt = "\n".join(
-                [
-                    f"Job ID   : {job_id}",
-                    f"Input    : {stem or '-'}",
-                    f"VPS      : {', '.join(cfg.get('vps_ids') or []) or '-'}",
-                    f"Valid    : {counts['hit_valid.txt']}",
-                    f"2FA/OTP  : {counts['hit_2fa.txt']}",
-                    f"Invalid  : {counts['invalid.txt']}",
-                    f"Error    : {counts['err.txt']}",
-                ]
-            ) + "\n"
-            buf = io.BytesIO()
-            with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                zf.writestr("summary.txt", summary_txt.encode("utf-8"))
-                for fn in _OUTPUT_RESULT_FILES:
-                    if merged[fn]:
-                        zf.writestr(fn, ("\n".join(merged[fn]) + "\n").encode("utf-8"))
-            return zip_name, buf.getvalue(), counts
+            summary = [
+                f"Job ID   : {job_id}",
+                f"Input    : {stem or '-'}",
+                f"VPS      : {', '.join(cfg.get('vps_ids') or []) or '-'}",
+            ]
+            return _assemble_result_zip_sync(zip_name, summary, valid_rows, otp_rows, zpaths)
 
-        return await asyncio.to_thread(_assemble)
+        return await asyncio.to_thread(_prep)
 
-    async def _dispatch_job_tg_zip(job_id: str) -> dict:
+    async def _build_checked_vps_zip(vps_ids: list[str], scope: str = "latest") -> tuple[str, bytes, dict]:
+        clean_ids = [_validate_safe_id(v, "vps_id") for v in vps_ids]
+        if not clean_ids:
+            raise HTTPException(status_code=400, detail="Centang minimal 1 VPS")
+        nodes, _ = await db.list_nodes(offline_after_s=offline_s, stall_after_s=stall_s)
+        by_id = {n["vps_id"]: n for n in nodes}
+        unknown = [v for v in clean_ids if v not in by_id]
+        if unknown:
+            raise HTTPException(status_code=404, detail=f"Unknown VPS IDs: {', '.join(unknown)}")
+
+        jobs = await db.list_jobs(limit=200)
+        jobs_dir = os.path.join(base_data, "jobs")
+
+        def _discover_pairs() -> tuple[set[tuple[str, str]], list[str]]:
+            vid_set = set(clean_ids)
+            pairs: set[tuple[str, str]] = set()
+            if scope == "latest":
+                for vid in clean_ids:
+                    cur_jid = str((by_id[vid].get("telemetry") or {}).get("job_id") or "").strip()
+                    if cur_jid:
+                        pairs.add((cur_jid, vid))
+                        continue
+                    for j in jobs:
+                        jid = j["job_id"]
+                        zfp = os.path.join(jobs_dir, jid, "outputs", f"{vid}.zip")
+                        if vid in (j.get("vps_ids") or []) or os.path.isfile(zfp):
+                            pairs.add((jid, vid))
+                            break
+            else:
+                for j in jobs:
+                    jid = j["job_id"]
+                    for vid in clean_ids:
+                        zfp = os.path.join(jobs_dir, jid, "outputs", f"{vid}.zip")
+                        if vid in (j.get("vps_ids") or []) or os.path.isfile(zfp):
+                            pairs.add((jid, vid))
+                for vid in clean_ids:
+                    cur_jid = str((by_id[vid].get("telemetry") or {}).get("job_id") or "").strip()
+                    if cur_jid:
+                        pairs.add((cur_jid, vid))
+                if os.path.isdir(jobs_dir):
+                    for jid in os.listdir(jobs_dir):
+                        od = os.path.join(jobs_dir, jid, "outputs")
+                        if not os.path.isdir(od):
+                            continue
+                        for vid in vid_set:
+                            if os.path.isfile(os.path.join(od, f"{vid}.zip")):
+                                pairs.add((jid, vid))
+            zpaths = sorted(
+                os.path.join(jobs_dir, jid, "outputs", f"{vid}.zip")
+                for jid, vid in pairs
+                if os.path.isfile(os.path.join(jobs_dir, jid, "outputs", f"{vid}.zip"))
+            )
+            return pairs, zpaths
+
+        target_pairs, zpaths = await asyncio.to_thread(_discover_pairs)
+        target_jids = sorted({jid for jid, _ in target_pairs})
+        valid_rows = [
+            r for r in await db.export_hits_for_vps(clean_ids, "VALID", target_jids)
+            if (r["job_id"], r["vps_id"]) in target_pairs
+        ]
+        otp_rows = [
+            r for r in await db.export_hits_for_vps(clean_ids, "OTP", target_jids)
+            if (r["job_id"], r["vps_id"]) in target_pairs
+        ]
+        label = "_".join(clean_ids[:3]) + (f"_+{len(clean_ids) - 3}" if len(clean_ids) > 3 else "")
+        zip_name = f"output_{label}_{int(time.time())}.zip"
+        summary = [
+            f"VPS      : {', '.join(clean_ids)}",
+            f"Scope    : {scope}",
+            f"Jobs     : {', '.join(target_jids) or '-'}",
+        ]
+        return await asyncio.to_thread(_assemble_result_zip_sync, zip_name, summary, valid_rows, otp_rows, zpaths)
+
+    async def _send_zip_to_telegram(zip_name: str, zbytes: bytes, counts: dict) -> dict:
         if not (resolved_tg_tok and resolved_tg_chat):
             raise HTTPException(status_code=400, detail="Telegram token/chat_id belum dikonfigurasi")
-        zip_name, zbytes, counts = await _build_job_zip(job_id)
         caption = (
             f"📦 Output {zip_name}\n"
             f"VALID: {counts['hit_valid.txt']} | 2FA: {counts['hit_2fa.txt']} | "
@@ -699,9 +791,13 @@ def create_app(
         res = await asyncio.to_thread(
             _send_telegram_zip_sync, resolved_tg_tok, resolved_tg_chat, zip_name, zbytes, caption
         )
-        ok = bool(res.get("ok") is True)
-        if not ok:
+        if res.get("ok") is not True:
             raise HTTPException(status_code=502, detail=f"Telegram API failed: {res}")
+        return {"ok": True, "zip_name": zip_name, "counts": counts}
+
+    async def _dispatch_job_tg_zip(job_id: str) -> dict:
+        zip_name, zbytes, counts = await _build_job_zip(job_id)
+        out = await _send_zip_to_telegram(zip_name, zbytes, counts)
 
         def _mark_sent() -> None:
             jdir = os.path.join(base_data, "jobs", job_id)
@@ -710,7 +806,21 @@ def create_app(
                 f.write(str(time.time()))
 
         await asyncio.to_thread(_mark_sent)
-        return {"ok": True, "zip_name": zip_name, "counts": counts}
+        return out
+
+    @app.post("/api/v1/results/checked/zip", dependencies=[Depends(require_ui_auth)])
+    async def download_checked_results_zip(body: CheckedResultsBody):
+        zip_name, zbytes, _ = await _build_checked_vps_zip(body.vps_ids, scope=body.scope)
+        return Response(
+            zbytes,
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{zip_name}"'},
+        )
+
+    @app.post("/api/v1/results/checked/telegram", dependencies=[Depends(require_ui_auth)])
+    async def send_checked_results_telegram(body: CheckedResultsBody):
+        zip_name, zbytes, counts = await _build_checked_vps_zip(body.vps_ids, scope=body.scope)
+        return await _send_zip_to_telegram(zip_name, zbytes, counts)
 
     @app.get("/api/v1/results/{job_id}/zip", dependencies=[Depends(require_ui_auth)])
     async def download_results_zip(job_id: str):
@@ -808,8 +918,11 @@ def create_app(
                 jdir = os.path.join(base_data, "jobs", jid)
                 odir = os.path.join(jdir, "outputs")
                 os.makedirs(odir, exist_ok=True)
-                with open(os.path.join(odir, f"{vps_id}.zip"), "wb") as f:
+                zdst = os.path.join(odir, f"{vps_id}.zip")
+                ztmp = f"{zdst}.tmp.{secrets.token_hex(4)}"
+                with open(ztmp, "wb") as f:
                     f.write(raw)
+                os.replace(ztmp, zdst)
                 done = {fn[:-4] for fn in os.listdir(odir) if fn.endswith(".zip")}
                 sent = os.path.isfile(os.path.join(jdir, ".tg_sent"))
                 return done, sent
