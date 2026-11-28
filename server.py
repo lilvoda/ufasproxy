@@ -1206,11 +1206,15 @@ def _load_local_env(base_dir: str) -> dict[str, str]:
 
 
 def _provider_label(cfg_path: str) -> str:
-    """Derive short provider name from parent ovpn folder (e.g. vpns-proton -> proton)."""
+    """Normalize multi-account provider folder name (e.g. vpns-proton-2 / vpns-proton-free -> proton)."""
     parent = os.path.basename(os.path.dirname(os.path.abspath(cfg_path))) or "default"
     low = parent.lower()
     if low.startswith(("vpns-", "vpns_")) and len(parent) > 5:
-        return parent[5:]
+        parent = parent[5:]
+        low = parent.lower()
+    for base in ("proton", "surfshark", "pia", "express"):
+        if low == base or low.startswith((f"{base}-", f"{base}_")):
+            return base
     return parent
 
 
@@ -1411,6 +1415,18 @@ class GatewayServer:
         self.default_ttl_s = float(ttl_s)
         self.reap_interval_s = reap_interval_s
         self._pool_by_provider = Counter(_provider_label(c) for c in self._configs)
+        self._prov_unique_cfgs: dict[str, dict[str, list[str]]] = {}
+        self._prov_caps: dict[str, int] = {}
+        seen_ak_prov: set[tuple[str, str]] = set()
+        for c in self._configs:
+            prov = _provider_label(c)
+            self._prov_unique_cfgs.setdefault(prov, {}).setdefault(os.path.basename(c).lower(), []).append(c)
+            ak = self._cfg_auth.get(c, self._auth_file) or os.path.dirname(os.path.abspath(c))
+            if (prov, ak) not in seen_ak_prov:
+                seen_ak_prov.add((prov, ak))
+                cap = self._auth_cap_for(ak, c)
+                if cap > 0:
+                    self._prov_caps[prov] = self._prov_caps.get(prov, 0) + cap
 
         self.tg_token = (tg_token or "").strip()
         self.tg_chat_id = str(tg_chat_id or "").strip()
@@ -2289,8 +2305,16 @@ class GatewayServer:
         async with self._lock:
             active_slots = len(self._slot_owners)
             pending_slots = sum(len(v) for v in self._pending_leases.values())
-            cooldown_cnt = sum(1 for until in self._cooldowns.values() if until > now)
             active_by_prov = Counter(_provider_label(cfg) for cfg in self._reserved_cfgs.values() if cfg)
+            prov_stats: list[tuple[str, int, int, int, int]] = []
+            for prov in sorted(self._prov_unique_cfgs.keys()):
+                bmap = self._prov_unique_cfgs[prov]
+                total_u = len(bmap)
+                ready_u = sum(
+                    1 for cpaths in bmap.values()
+                    if any(self._cooldowns.get(cp, 0.0) <= now for cp in cpaths)
+                )
+                prov_stats.append((prov, active_by_prov.get(prov, 0), self._prov_caps.get(prov, 0), ready_u, total_u))
             leases_snap = sorted(
                 (
                     (
@@ -2310,7 +2334,6 @@ class GatewayServer:
         pct = int(round((active_slots / self.max_slots) * 100)) if self.max_slots else 0
         filled = min(10, max(0, round((active_slots / self.max_slots) * 10))) if self.max_slots else 0
         bar = "█" * filled + "░" * (10 - filled)
-        ready_cfgs = max(0, len(self._configs) - cooldown_cnt)
 
         try:
             l1, l5, _l15 = os.getloadavg()
@@ -2326,23 +2349,29 @@ class GatewayServer:
         if pending_slots:
             slot_line += f" · pending {pending_slots}"
 
-        prov_active = " · ".join(f"{html.escape(k)} {v}" for k, v in sorted(active_by_prov.items())) or "-"
-        pool_parts = " · ".join(f"{html.escape(k)} {v:,}" for k, v in sorted(self._pool_by_provider.items()))
+        prov_rows = []
+        tot_pool = sum(t for _, _, _, _, t in prov_stats)
+        tot_ready = sum(r for _, _, _, r, _ in prov_stats)
+        for prov, act, cap, rdy, tot in prov_stats:
+            cap_s = f"{act}/{cap}" if cap > 0 else f"{act}"
+            prov_rows.append(f"<code>{html.escape(prov):<9} {cap_s:>6} | siap {rdy:>4,}/{tot:,}</code>")
 
         lines = [
             f"{badge} · <code>{html.escape(self.public_ip)}:{self.port}</code> · up {up_s}",
             slot_line,
-            f"Tunnel: {prov_active}",
-            f"Pool: <b>{len(self._configs):,}</b> ({pool_parts}) | Siap: <b>{ready_cfgs:,}</b> | Cooldown: <b>{cooldown_cnt:,}</b>",
-            f"Host: load {load_s} | RAM {mem_s}",
+            "",
+            f"<b>📡 Tunnel &amp; Pool</b> (siap <b>{tot_ready:,}/{tot_pool:,}</b>)",
+            *prov_rows,
+            "",
+            f"⚙️ Host: load {load_s} · RAM {mem_s}",
         ]
 
         if leases_snap:
-            lines.append(f"<b>Leases ({len(leases_snap)}):</b>")
+            lines.append(f"<b>📋 Leases ({len(leases_snap)}):</b>")
             for idx, (slots_list, client_name, alive_cnt, total_cnt, rem_ttl) in enumerate(leases_snap):
                 entry_line = (
                     f"• <code>{html.escape(client_name)}</code>: "
-                    f"<b>{alive_cnt}/{total_cnt}</b> ok · slot { _fmt_slot_ranges(slots_list) } · TTL {rem_ttl}s"
+                    f"<b>{alive_cnt}/{total_cnt}</b> · slot {_fmt_slot_ranges(slots_list)} · {rem_ttl}s"
                 )
                 projected = "\n".join(lines + [entry_line, "", "<i>Updated: 0000-00-00 00:00:00 UTC</i>"])
                 if len(projected) > MAX_TG_MSG_CHARS - 80:
@@ -2350,10 +2379,10 @@ class GatewayServer:
                     break
                 lines.append(entry_line)
         else:
-            lines.append("Leases: <i>kosong</i>")
+            lines.append("📋 Leases: <i>kosong</i>")
 
         tz_name = time.strftime("%Z") or "local"
-        lines.append(f"<i>Updated: {time.strftime('%Y-%m-%d %H:%M:%S')} {html.escape(tz_name)}</i>")
+        lines.extend(["", f"<i>Updated: {time.strftime('%Y-%m-%d %H:%M:%S')} {html.escape(tz_name)}</i>"])
         msg = "\n".join(lines)
         if len(msg) > MAX_TG_MSG_CHARS:
             msg = msg[: MAX_TG_MSG_CHARS - 20].rsplit("\n", 1)[0] + "\n<i>...(truncated)</i>"
@@ -3472,7 +3501,9 @@ async def _selftest_gateway_async() -> None:
                 assert await gw_tg._push_tg_status() is True
                 assert tg_calls[-1][0] == "editMessageText", tg_calls[-1]
                 txt_edit = tg_calls[-1][1]["text"]
-                assert "&lt;bad&amp;client&gt;" in txt_edit and "<b>1/2</b>" in txt_edit and "pia 1" in txt_edit, txt_edit
+                assert "&lt;bad&amp;client&gt;" in txt_edit and "<b>1/2</b>" in txt_edit and "pia" in txt_edit and "1/20" in txt_edit, txt_edit
+                assert _provider_label("/x/vpns-proton-2/us.ovpn") == "proton"
+                assert _provider_label("/x/vpns-proton-free/us.ovpn") == "proton"
 
                 # message is not modified -> no fallback sendMessage
                 gw_tg._tg_last_text = ""
