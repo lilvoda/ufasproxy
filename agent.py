@@ -135,6 +135,7 @@ class MuseAgent:
         self.benchmark: dict | None = self._load_benchmark()
         self._prev_cpu: tuple[int, int] | None = None
         self._reconnect_needed = False
+        self._reload_pending = False
 
     def _resolve_checker_python(self) -> str:
         cands = (
@@ -621,7 +622,11 @@ class MuseAgent:
                     capture_output=True,
                     text=True,
                 )
-                return rc.returncode == 0, (rc.stdout or rc.stderr).strip()[:200]
+                out = (rc.stdout or rc.stderr).strip()[:200]
+                if rc.returncode == 0:
+                    self._reload_pending = True
+                    return True, f"{out} (reloading)"
+                return False, out
             if ctype == "BENCHMARK":
                 b = self.run_benchmark()
                 return True, f"workers={b['recommended_workers']}"
@@ -744,6 +749,9 @@ class MuseAgent:
                                     if ok and cmd_id:
                                         self.mark_cmd_seen(cmd_id)
                                 await ws.send(json.dumps({"type": "cmd_ack", "cmd_id": cmd_id, "ok": ok, "message": detail}))
+                                if self._reload_pending:
+                                    await ws.close()
+                                    os.execv(sys.executable, [sys.executable, *sys.argv])
 
                     t_send = asyncio.create_task(_sender())
                     t_recv = asyncio.create_task(_receiver())

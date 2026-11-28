@@ -366,6 +366,23 @@ def test_single_output_zip_aggregation(tmp_path, monkeypatch):
             assert full_a.count("STATUS       : [NOT BANNED]") == 2
             assert "combo_a" in zf.read("summary.txt").decode("utf-8")
 
+        # Hits streamed via /api/v1/agent/hits (e.g. running CT without archive upload yet) also appear in output.zip
+        client.post(
+            "/api/v1/agent/register-job",
+            json={"job_id": "manual_stream_1", "filename": "live_ct.txt"},
+            headers={"Authorization": f"Bearer {t2}"},
+        )
+        client.post(
+            "/api/v1/agent/hits",
+            json={"job_id": "manual_stream_1", "hit_type": "VALID", "lines": ["s1:p1|t|1|Stream|2026"]},
+            headers={"Authorization": f"Bearer {t2}"},
+        )
+        dl_stream = client.post("/api/v1/results/output.zip", json={"vps_ids": ["vps-2"]}, headers=hdr)
+        assert dl_stream.status_code == 200
+        with zipfile.ZipFile(io.BytesIO(dl_stream.content), "r") as zf:
+            assert "live_ct/hit_valid.txt" in set(zf.namelist())
+            assert "s1:p1|t|1|Stream|2026" in zf.read("live_ct/hit_valid.txt").decode("utf-8")
+
         tg_res = client.post("/api/v1/results/output-zip/telegram", json={"vps_ids": []}, headers=hdr)
         assert tg_res.status_code == 200 and tg_res.json()["zip_name"] == "output.zip"
         assert tg_calls and tg_calls[-1][0] == "output.zip"

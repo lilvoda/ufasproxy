@@ -929,6 +929,9 @@ def create_app(
             for j in jobs
         }
 
+        valid_rows = await db.export_hits_for_vps(clean_ids, "VALID") if clean_ids else []
+        otp_rows = await db.export_hits_for_vps(clean_ids, "OTP") if clean_ids else []
+
         vps_out_dir = os.path.join(base_data, "vps_outputs")
         arc_blobs: list[bytes] = []
         for vid in clean_ids:
@@ -979,6 +982,12 @@ def create_app(
                         _ingest(folder, rel, raw_text)
                 except Exception:
                     continue
+
+            for rel, rows in (("hit_valid.txt", valid_rows), ("hit_2fa.txt", otp_rows)):
+                for r in rows:
+                    ln = str(r.get("raw_line") or "").strip()
+                    if ln:
+                        _ingest(str(r["job_id"]), rel, ln)
 
             jobs_dir = os.path.join(base_data, "jobs")
             target_set = set(clean_ids)
