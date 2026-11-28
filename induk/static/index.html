@@ -22,8 +22,8 @@
   </header>
 
   <main class="container">
-    <section class="kpis" id="kpi-strip">
-      <div class="kpi"><span class="k-lbl">PROCESSED</span><strong id="k-proc">0 / 0</strong></div>
+    <section class="kpis" id="kpi-strip" title="Ringkasan gabungan semua VPS terdaftar">
+      <div class="kpi"><span class="k-lbl">PROCESSED (ALL VPS)</span><strong id="k-proc">0 / 0</strong></div>
       <div class="kpi"><span class="k-lbl">VALID</span><strong class="ok" id="k-valid">0</strong></div>
       <div class="kpi"><span class="k-lbl">2FA / OTP</span><strong class="warn" id="k-otp">0</strong></div>
       <div class="kpi"><span class="k-lbl">SPEED</span><strong id="k-rate">0.0/s</strong></div>
@@ -38,9 +38,6 @@
         <div class="bulk-bar">
           <button onclick="bulkCmd('STOP')">Stop Checked</button>
           <button onclick="bulkCmd('RESTART')">Restart Checked</button>
-          <button onclick="bulkCmd('ROTATE_VPN')">Rotate VPN</button>
-          <button onclick="distributeVpn()">Split &amp; Sync VPN</button>
-          <button onclick="bulkCmd('BENCHMARK')">Re-Benchmark</button>
           <button onclick="bulkCmd('UPDATE_CODE')">Git Pull</button>
         </div>
       </div>
@@ -57,7 +54,6 @@
               <th>WAF</th>
               <th>Workers</th>
               <th>VPN / Gateway</th>
-              <th>Sistem Pintar</th>
               <th>Aksi</th>
             </tr>
           </thead>
@@ -69,54 +65,43 @@
     <section class="grid-2">
       <div class="card">
         <div class="card-head">
-          <h2>Sistem Pintar &amp; Live Monitor</h2>
-          <select id="inspect-vps-select"></select>
+          <h2>Live Log (Gabungan VPS Tercentang)</h2>
+          <span class="muted" id="live-log-hint"></span>
         </div>
-        <div id="smart-panel" class="smart-panel muted">Pilih VPS untuk lihat detail Sistem Pintar.</div>
         <pre id="live-logs" class="log-box"></pre>
       </div>
 
       <div class="card">
         <div class="card-head">
           <h2>Send Input &amp; Jalankan</h2>
-          <div class="tabs">
-            <button class="tab active" data-mode="split" id="mode-split-btn">Split Otomatis</button>
-            <button class="tab" data-mode="per_vps" id="mode-11-btn">Per-VPS (1-1)</button>
-          </div>
-        </div>
-        <div id="split-box">
-          <div class="row">
-            <label>Strategi Split:
-              <select id="split-strategy">
-                <option value="weighted">Berbobot (sesuai Benchmark Workers)</option>
-                <option value="even">Rata Sama Besar</option>
-              </select>
-            </label>
-            <label>Upload .txt: <input type="file" id="combo-file" accept=".txt" /></label>
-          </div>
-          <textarea id="combo-text" rows="5" placeholder="Paste combo user:pass per baris..."></textarea>
-        </div>
-        <div id="per-vps-box" class="hidden"></div>
-        <div class="row">
-          <label>Workers (0 = Auto Bench): <input type="number" id="run-workers" value="0" min="0" max="30" /></label>
-          <label>WAF Threshold: <input type="number" id="run-waf" value="3" min="1" max="50" /></label>
-          <label>Cooldown (s): <input type="number" id="run-cd" value="25" min="3" max="300" /></label>
+          <span class="muted">1 File Combo -&gt; VPS Tercentang</span>
         </div>
         <div class="row">
-          <input type="text" id="run-vpn-api-url" placeholder="Gateway URL (kosong = token.env worker)" />
-          <label><input type="checkbox" id="run-two-tab" /> 2-Tab</label>
-          <label><input type="checkbox" id="run-skip-ovpn" /> Skip OVPN Test</label>
-          <label><input type="checkbox" id="run-dist-vpn" /> Auto Split Folder .ovpn Lokal</label>
+          <label>Upload .txt: <input type="file" id="combo-file" accept=".txt" /></label>
+          <span class="muted" id="combo-fname"></span>
         </div>
-        <div id="vpn-pool-info" class="muted"></div>
-        <button class="primary" id="dispatch-btn">Jalankan di VPS Tercentang</button>
+        <textarea id="combo-text" rows="5" placeholder="Upload file .txt atau paste combo user:pass per baris..."></textarea>
+        <div class="row">
+          <label>Workers:
+            <select id="run-workers">
+              <option value="auto">auto</option>
+            </select>
+          </label>
+          <label>2-Tab:
+            <select id="run-two-tab">
+              <option value="n">N (1 Tab)</option>
+              <option value="y">Y (2 Tab)</option>
+            </select>
+          </label>
+        </div>
+        <button class="primary" id="dispatch-btn">Send Input &amp; Jalankan</button>
       </div>
     </section>
 
     <section class="grid-2">
       <div class="card">
         <div class="card-head">
-          <h2>Setup VPS Baru (Multi-Distro Linux + Auto Benchmark)</h2>
+          <h2>Setup VPS Client (Auto-Setup Siap Combo)</h2>
           <select id="prov-mode">
             <option value="ssh">Auto-SSH Install</option>
             <option value="bootstrap">One-Line Bootstrap</option>
@@ -137,31 +122,27 @@
           </div>
           <textarea id="prov-key" rows="2" placeholder="SSH Private Key (opsional)"></textarea>
         </div>
-        <div class="row">
-          <input type="text" id="prov-induk-url" placeholder="INDUK_URL (kosong = URL saat ini)" />
-          <input type="text" id="prov-ptr-url" placeholder="INDUK_POINTER_URL (opsional)" />
-        </div>
-        <button class="primary" id="prov-btn">Setup &amp; Benchmark VPS</button>
+        <button class="primary" id="prov-btn">Setup Client VPS</button>
         <pre id="prov-log" class="log-box"></pre>
       </div>
 
       <div class="card">
-        <div class="card-head"><h2>Hasil Hits &amp; Migrasi Induk</h2></div>
+        <div class="card-head">
+          <h2>Hasil Output (.zip) &amp; Telegram</h2>
+          <button id="refresh-jobs-btn">Refresh</button>
+        </div>
         <div class="row">
-          <input type="text" id="res-job-id" value="all" placeholder="Job ID atau 'all'" />
-          <select id="res-type"><option value="VALID">VALID</option><option value="OTP">2FA / OTP</option></select>
-          <select id="res-dedup"><option value="per_job">Dedup Per-Job</option><option value="global">Dedup Global</option></select>
-          <button id="download-hits-btn">Download .txt</button>
+          <select id="res-job-select"></select>
+        </div>
+        <div class="row">
+          <button class="primary" id="download-zip-btn">Download .zip</button>
+          <button id="send-tg-btn">Kirim ke Telegram</button>
         </div>
         <hr />
         <div class="row">
-          <button id="backup-btn">1-Klik Download Backup (.tar.gz)</button>
+          <button id="backup-btn">Backup State (.tar.gz)</button>
           <input type="file" id="restore-file" accept=".tar.gz" />
-          <button id="restore-btn">Restore Backup</button>
-        </div>
-        <div class="row">
-          <input type="text" id="new-induk-url" placeholder="URL Induk Baru (http://IP:8000)" />
-          <button id="migrate-btn">Push SET_INDUK ke Semua/Tercentang</button>
+          <button id="restore-btn">Restore</button>
         </div>
         <div id="sys-msg" class="muted"></div>
       </div>

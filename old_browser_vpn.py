@@ -5661,7 +5661,8 @@ async def async_main():
     pa.add_argument('--vpn-rotate-every', type=int, default=0, help='Rotasi/jeda VPN proaktif tiap N akun')
     pa.add_argument('--no-vpn-ip-check', action='store_true', help='Lewati cek public IP VPN')
     pa.add_argument('--license-key', type=str, default='')
-    pa.add_argument('--two-tab', action='store_true', default=False)
+    pa.add_argument('--two-tab', dest='two_tab', action='store_true', default=None)
+    pa.add_argument('--no-two-tab', dest='two_tab', action='store_false', default=None)
     pa.add_argument('--ascii', action='store_true', help='Paksa UI pure ASCII (tanpa Unicode box drawing)')
     pa.add_argument('--status-json', type=str, default='', help='Tulis snapshot progress & Sistem Pintar periodik ke file JSON')
     pa.add_argument('--induk-host', type=str, default='', help='Hostname/IP VPS Induk untuk bypass route non-tunnel')
@@ -6102,7 +6103,7 @@ async def async_main():
         default_w = 2 if _PLAT['is_android'] else 4
         if auto_workers:
             workers = hw_info['hw_max']
-            auto_two_tab = not bool(args.two_tab)
+            auto_two_tab = (args.two_tab is None)
         else:
             workers = max(1, min(30, _w_arg or default_w))
         HEADLESS = args.headless if args.headless is not None else True
@@ -6169,7 +6170,8 @@ async def async_main():
         if workers_str in ('', 'auto', 'a'):
             auto_workers = True
             workers = hw_info['hw_max']
-            _tt_ans = ask("2-tab extra worker? (y/n/auto)", "y" if args.two_tab else "auto").strip().lower()
+            _tt_def = "y" if args.two_tab is True else ("n" if args.two_tab is False else "auto")
+            _tt_ans = ask("2-tab extra worker? (y/n/auto)", _tt_def).strip().lower()
             if _tt_ans in ('y', 'yes'):
                 TWO_TAB = True
                 auto_two_tab = False

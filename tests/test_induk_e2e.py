@@ -1,4 +1,7 @@
+import io
+import zipfile
 from fastapi.testclient import TestClient
+import induk.app as app_mod
 from induk.app import create_app
 
 
@@ -9,7 +12,11 @@ def test_static_ui_and_full_dispatch_hit_flow(tmp_path):
 
     app = create_app(db_path=str(tmp_path / "induk.db"), api_key="k", data_dir=str(tmp_path), repo_dir=str(tmp_path))
     with TestClient(app) as client:
-        assert client.get("/").status_code == 200
+        html = client.get("/").text
+        assert "run-workers" in html and "run-two-tab" in html
+        assert "download-zip-btn" in html and "send-tg-btn" in html
+        assert "prov-induk-url" not in html and "prov-ptr-url" not in html
+        assert "smart-panel" not in html and "Rotate VPN" not in html
         assert client.get("/static/app.js").status_code == 200
         assert client.get("/static/styles.css").status_code == 200
         hdr = {"X-API-Key": "k"}
@@ -18,12 +25,23 @@ def test_static_ui_and_full_dispatch_hit_flow(tmp_path):
         with client.websocket_connect("/ws/agent", headers={"Authorization": f"Bearer {tok}"}) as ws:
             disp = client.post(
                 "/api/v1/jobs/dispatch",
-                json={"vps_ids": ["vps-1"], "mode": "split", "combo_text": "u1:p1\nu2:p2", "args": []},
+                json={
+                    "vps_ids": ["vps-1"],
+                    "mode": "split",
+                    "combo_text": "u1:p1\nu2:p2",
+                    "workers": "auto",
+                    "two_tab": False,
+                    "filename": "arch1.txt",
+                    "args": [],
+                },
                 headers=hdr,
             )
             assert disp.status_code == 200
             job_id = disp.json()["job_id"]
-            assert ws.receive_json()["command"]["type"] == "START"
+            start_cmd = ws.receive_json()["command"]
+            assert start_cmd["type"] == "START"
+            assert "--no-two-tab" in start_cmd["payload"]["args"]
+            assert "--workers" in start_cmd["payload"]["args"] and "auto" in start_cmd["payload"]["args"]
             assert "u1:p1" in client.get(f"/api/v1/agent/combo/{job_id}/vps-1", headers={"Authorization": f"Bearer {tok}"}).text
             assert (
                 client.post(
@@ -35,3 +53,97 @@ def test_static_ui_and_full_dispatch_hit_flow(tmp_path):
             )
 
         assert "u1:p1|tok" in client.get(f"/api/v1/results/{job_id}?hit_type=VALID&format=txt", headers=hdr).text
+
+
+def test_job_output_zip_and_telegram_auto_and_manual_send(tmp_path, monkeypatch):
+    tg_calls = []
+
+    def _fake_tg(tok, chat, fn, data, cap):
+        tg_calls.append((tok, chat, fn, data, cap))
+        return {"ok": True}
+
+    monkeypatch.setattr(app_mod, "_send_telegram_zip_sync", _fake_tg)
+    app = create_app(
+        db_path=str(tmp_path / "z.db"),
+        api_key="k",
+        data_dir=str(tmp_path),
+        repo_dir=str(tmp_path),
+        tg_token="bot-tok",
+        tg_chat_id="chat-1",
+    )
+    with TestClient(app) as client:
+        hdr = {"X-API-Key": "k"}
+        tok = client.post("/api/v1/vps", json={"vps_id": "vps-1"}, headers=hdr).json()["agent_token"]
+        disp = client.post(
+            "/api/v1/jobs/dispatch",
+            json={
+                "vps_ids": ["vps-1"],
+                "combo_text": "u1:p1\nu2:p2",
+                "workers": "6",
+                "two_tab": True,
+                "filename": "koi_batch.txt",
+            },
+            headers=hdr,
+        )
+        assert disp.status_code == 200
+        job_id = disp.json()["job_id"]
+
+        # Disallowed path inside output zip rejected
+        bad_buf = io.BytesIO()
+        with zipfile.ZipFile(bad_buf, "w") as zf:
+            zf.writestr("../evil.txt", "x")
+        assert (
+            client.post(
+                f"/api/v1/agent/output/{job_id}",
+                content=bad_buf.getvalue(),
+                headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/zip"},
+            ).status_code
+            == 400
+        )
+
+        # Valid output zip triggers auto Telegram sendDocument once all expected VPS upload
+        ok_buf = io.BytesIO()
+        with zipfile.ZipFile(ok_buf, "w") as zf:
+            zf.writestr("hit_valid.txt", "u1:p1|tok|1|Hero|2026-11-28 00:00:00\n")
+            zf.writestr("invalid.txt", "u2:p2|2026-11-28 00:00:00\n")
+        up = client.post(
+            f"/api/v1/agent/output/{job_id}",
+            content=ok_buf.getvalue(),
+            headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/zip"},
+        )
+        assert up.status_code == 200 and up.json()["tg_auto_sent"] is True
+        assert len(tg_calls) == 1 and tg_calls[0][2] == f"koi_batch_{job_id}.zip"
+
+        # Download zip returns merged results + summary.txt
+        zres = client.get(f"/api/v1/results/{job_id}/zip", headers=hdr)
+        assert zres.status_code == 200
+        with zipfile.ZipFile(io.BytesIO(zres.content), "r") as zf:
+            names = set(zf.namelist())
+            assert {"summary.txt", "hit_valid.txt", "invalid.txt"}.issubset(names)
+            assert "u1:p1|tok" in zf.read("hit_valid.txt").decode("utf-8")
+
+        # Manual Telegram resend works & job list reflects tg_sent
+        assert client.post(f"/api/v1/results/{job_id}/telegram", headers=hdr).status_code == 200
+        assert len(tg_calls) == 2
+        jobs = client.get("/api/v1/jobs", headers=hdr).json()["jobs"]
+        assert jobs[0]["job_id"] == job_id and jobs[0]["tg_sent"] is True and jobs[0]["filename"] == "koi_batch"
+
+        # Unassigned VPS rejected on agent output upload (403)
+        tok2 = client.post("/api/v1/vps", json={"vps_id": "vps-2"}, headers=hdr).json()["agent_token"]
+        assert (
+            client.post(
+                f"/api/v1/agent/output/{job_id}",
+                content=ok_buf.getvalue(),
+                headers={"Authorization": f"Bearer {tok2}", "Content-Type": "application/zip"},
+            ).status_code
+            == 403
+        )
+
+        # Oversized / newline heredoc breakout rejected cleanly with zero DB side effects
+        bad_boot = client.post(
+            "/api/v1/vps/provision",
+            json={"vps_id": "vps-3", "mode": "bootstrap", "induk_url": "http://ok\nUFP_ENV\nid"},
+            headers=hdr,
+        )
+        assert bad_boot.status_code == 400
+        assert "vps-3" not in [n["vps_id"] for n in client.get("/api/v1/vps", headers=hdr).json()["nodes"]]

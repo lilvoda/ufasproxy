@@ -661,9 +661,32 @@ PY
   fi
   [[ -n "$induk_pass" ]] || induk_pass="$DEFAULT_INDUK_PASS"
 
+  local tg_tok tg_chat
+  tg_tok="${ARG_TG_TOKEN:-}"
+  tg_chat="${ARG_TG_CHAT_ID:-}"
+  if [[ -z "$tg_tok" && -f "$env_file" ]]; then
+    if [[ "$use_sudo" -eq 1 ]]; then
+      tg_tok="$($SUDO awk -F= '$1=="INDUK_TG_TOKEN"{print substr($0,index($0,"=")+1); exit}' "$env_file" 2>/dev/null || true)"
+    else
+      tg_tok="$(awk -F= '$1=="INDUK_TG_TOKEN"{print substr($0,index($0,"=")+1); exit}' "$env_file" 2>/dev/null || true)"
+    fi
+  fi
+  if [[ -z "$tg_chat" && -f "$env_file" ]]; then
+    if [[ "$use_sudo" -eq 1 ]]; then
+      tg_chat="$($SUDO awk -F= '$1=="INDUK_TG_CHAT_ID"{print substr($0,index($0,"=")+1); exit}' "$env_file" 2>/dev/null || true)"
+    else
+      tg_chat="$(awk -F= '$1=="INDUK_TG_CHAT_ID"{print substr($0,index($0,"=")+1); exit}' "$env_file" 2>/dev/null || true)"
+    fi
+  fi
+  [[ -n "$tg_tok" ]] || tg_tok="$DEFAULT_TG_TOKEN"
+  [[ -n "$tg_chat" ]] || tg_chat="$DEFAULT_TG_CHAT_ID"
+  if [[ "${tg_tok,,}" == "off" || "${tg_tok,,}" == "none" ]]; then
+    tg_tok=""; tg_chat=""
+  fi
+
   local env_payload
-  env_payload="$(printf 'INDUK_USER=%s\nINDUK_PASS=%s\nINDUK_DATA_DIR=%s\nINDUK_REPO_DIR=%s\nINDUK_PORT=%s' \
-    "$induk_user" "$induk_pass" "$SCRIPT_DIR/induk_data" "$SCRIPT_DIR" "$INDUK_PORT")"
+  env_payload="$(printf 'INDUK_USER=%s\nINDUK_PASS=%s\nINDUK_DATA_DIR=%s\nINDUK_REPO_DIR=%s\nINDUK_PORT=%s\nINDUK_TG_TOKEN=%s\nINDUK_TG_CHAT_ID=%s' \
+    "$induk_user" "$induk_pass" "$SCRIPT_DIR/induk_data" "$SCRIPT_DIR" "$INDUK_PORT" "$tg_tok" "$tg_chat")"
   _write_secret_file "$env_file" "$env_payload" "$use_sudo"
 
   if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]] && [[ "$SUDO" != "__NEED_ROOT__" ]]; then

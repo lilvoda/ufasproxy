@@ -4,6 +4,7 @@ import subprocess
 import sys
 import tarfile
 import time
+import zipfile
 from agent import MuseAgent, _is_pid_alive
 
 
@@ -103,3 +104,25 @@ def test_agent_dead_pid_tar_symlink_and_reap(tmp_path):
     assert ag2.proc.returncode is not None
     ok_rot, _ = ag2.execute_command({"type": "ROTATE_VPN", "payload": {}})
     assert ok_rot is False
+
+    # Finished output packaging uploads non-empty files once
+    out3 = tmp_path / "out_zip"
+    out3.mkdir()
+    (out3 / "hit_valid.txt").write_text("u:p|t|1|n|2026\n", encoding="utf-8")
+    (out3 / "invalid.txt").write_text("x:y|2026\n", encoding="utf-8")
+    (out3 / "hit_2fa.txt").write_text("", encoding="utf-8")
+    uploaded = []
+    ag2._http_request_raw = lambda m, p, data=None, content_type="", timeout=15.0: uploaded.append((p, data)) or b"{}"
+    ag2.active_job = {"pid": ag2.proc.pid, "job_id": "job_zip_1", "status_json": "", "output_dir": str(out3), "offsets": {}}
+    assert ag2.upload_finished_output_sync() is True
+    assert ag2.upload_finished_output_sync() is False
+    assert len(uploaded) == 1 and uploaded[0][0] == "/api/v1/agent/output/job_zip_1"
+    with zipfile.ZipFile(io.BytesIO(uploaded[0][1]), "r") as zf:
+        assert set(zf.namelist()) == {"hit_valid.txt", "invalid.txt"}
+
+    # RESTART must NOT trigger finished output upload for the same job_id
+    ag2.active_job = {"pid": ag2.proc.pid, "job_id": "job_restart_1", "status_json": "", "output_dir": str(out3), "offsets": {}, "payload": {"job_id": "job_restart_1"}}
+    called_restart = []
+    ag2._start_checker = lambda p, upload_prev=True: called_restart.append(upload_prev) or "ok"
+    ok_rs, _ = ag2.execute_command({"type": "RESTART", "payload": {}})
+    assert ok_rs is True and called_restart == [False]

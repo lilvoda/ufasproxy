@@ -101,6 +101,17 @@ def render_bootstrap_script(
     ufasproxy_url: str = "",
     ufasproxy_token: str = "",
 ) -> str:
+    for lbl, v in (
+        ("induk_url", induk_url),
+        ("vps_id", vps_id),
+        ("token", token),
+        ("repo_url", repo_url),
+        ("pointer_url", pointer_url),
+        ("ufasproxy_url", ufasproxy_url),
+        ("ufasproxy_token", ufasproxy_token),
+    ):
+        if any(c in (v or "") for c in ("\n", "\r", "\x00")):
+            raise ValueError(f"Invalid control characters in {lbl}")
     # Secrets passed via 0600 temp env inside shell (hidden from ps /proc/<pid>/cmdline)
     env_lines = [
         f"INDUK_URL={shlex.quote(induk_url)}",
@@ -173,6 +184,7 @@ async def provision_via_ssh(
     ufasproxy_url: str = "",
     ufasproxy_token: str = "",
     on_log: Callable[[str], Awaitable[None]] | None = None,
+    on_ready: Callable[[str, dict], Awaitable[None]] | None = None,
 ) -> dict:
     import asyncssh
 
@@ -202,6 +214,8 @@ async def provision_via_ssh(
         await _log(
             f"[{vps_id}] Auto-benchmark: {bench['cpu_cores']} vCPU, {bench['ram_mb']} MB RAM -> {bench['recommended_workers']} workers"
         )
+        if on_ready is not None:
+            await on_ready(os_tag, bench)
 
         script = render_bootstrap_script(
             induk_url, vps_id, token, repo_url, pointer_url, ufasproxy_url, ufasproxy_token

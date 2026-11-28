@@ -451,6 +451,59 @@ class IndukDB:
         async with self._lock:
             await asyncio.to_thread(_op)
 
+    async def get_job(self, job_id: str) -> dict | None:
+        def _op() -> dict | None:
+            row = self._ensure_conn().execute(
+                "SELECT job_id, mode, status, config_json, created_at FROM jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if not row:
+                return None
+            d = dict(row)
+            d["config"] = json.loads(d.pop("config_json") or "{}")
+            return d
+
+        async with self._lock:
+            return await asyncio.to_thread(_op)
+
+    async def list_jobs(self, limit: int = 30) -> list[dict]:
+        def _op() -> list[dict]:
+            conn = self._ensure_conn()
+            rows = conn.execute(
+                """
+                SELECT j.job_id, j.mode, j.status, j.config_json, j.created_at,
+                       COALESCE(SUM(CASE WHEN h.hit_type = 'VALID' THEN 1 ELSE 0 END), 0) AS valid_count,
+                       COALESCE(SUM(CASE WHEN h.hit_type = 'OTP' THEN 1 ELSE 0 END), 0) AS otp_count
+                FROM jobs j
+                LEFT JOIN hits h ON h.job_id = j.job_id
+                GROUP BY j.job_id
+                ORDER BY j.created_at DESC
+                LIMIT ?
+                """,
+                (max(1, min(100, int(limit))),),
+            ).fetchall()
+            out: list[dict] = []
+            for r in rows:
+                cfg = json.loads(r["config_json"] or "{}")
+                out.append(
+                    {
+                        "job_id": r["job_id"],
+                        "mode": r["mode"],
+                        "status": r["status"],
+                        "created_at": r["created_at"],
+                        "filename": str(cfg.get("filename") or ""),
+                        "vps_ids": list(cfg.get("vps_ids") or []),
+                        "workers": cfg.get("workers", "auto"),
+                        "two_tab": cfg.get("two_tab"),
+                        "valid_count": int(r["valid_count"] or 0),
+                        "otp_count": int(r["otp_count"] or 0),
+                    }
+                )
+            return out
+
+        async with self._lock:
+            return await asyncio.to_thread(_op)
+
     async def insert_hits(self, job_id: str, vps_id: str, hit_type: str, lines: list[str]) -> tuple[int, int]:
         now = time.time()
         ht = hit_type.upper()
