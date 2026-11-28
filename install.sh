@@ -661,8 +661,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory="$SCRIPT_DIR"
-EnvironmentFile="$env_file"
+WorkingDirectory=$SCRIPT_DIR
+EnvironmentFile=$env_file
 ExecStart="$SCRIPT_DIR/.venv_induk/bin/uvicorn" induk.app:app --host 0.0.0.0 --port $INDUK_PORT
 Restart=always
 RestartSec=5
@@ -800,8 +800,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory="$SCRIPT_DIR"
-EnvironmentFile="$ag_env"
+WorkingDirectory=$SCRIPT_DIR
+EnvironmentFile=$ag_env
 ExecStart="$SCRIPT_DIR/.venv/bin/python" "$SCRIPT_DIR/agent.py"
 Restart=always
 RestartSec=5
