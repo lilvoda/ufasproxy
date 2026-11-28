@@ -1539,14 +1539,22 @@ class GatewayServer:
         dur = min(self.MAX_FAIL_COOLDOWN_S, self.FAIL_COOLDOWN_S * min(4, streak))
         self._mark_cooldown(cfg, dur)
 
+    _PROVIDER_CAPS = (
+        ("proton-free", 1),
+        ("proton_free", 1),
+        ("proton", 9),
+        ("surfshark", 20),
+        ("pia", 20),
+        ("express", 10),
+    )
+
     @staticmethod
-    def _auth_cap_for(auth_path: str) -> int:
-        """Default safe concurrent tunnel caps per auth account (Proton Free=1, Proton Plus=9)."""
-        low = (auth_path or "").lower()
-        if "proton-free" in low or "proton_free" in low:
-            return 1
-        if "proton" in low:
-            return 9
+    def _auth_cap_for(auth_path: str, cfg_path: str = "") -> int:
+        """Concurrent tunnel caps per auth account/provider (surfshark=20, pia=20, express=10, proton=9, free=1)."""
+        low = f"{auth_path or ''} {cfg_path or ''}".lower()
+        for pat, cap in GatewayServer._PROVIDER_CAPS:
+            if pat in low:
+                return cap
         return 0
 
     def _pick_next_config(self, exclude: set[str], allow_cooldown_fallback: bool) -> str | None:
@@ -1556,14 +1564,18 @@ class GatewayServer:
         n = len(self._configs)
         if n == 0:
             return None
+
+        def _auth_key(cfg: str) -> str:
+            return self._cfg_auth.get(cfg, self._auth_file) or os.path.dirname(os.path.abspath(cfg))
+
         active_by_auth: dict[str, int] = {}
         for rc_cfg in self._reserved_cfgs.values():
-            ak = self._cfg_auth.get(rc_cfg, self._auth_file)
+            ak = _auth_key(rc_cfg)
             active_by_auth[ak] = active_by_auth.get(ak, 0) + 1
 
         def _under_cap(cfg: str) -> bool:
-            ak = self._cfg_auth.get(cfg, self._auth_file)
-            cap = self._auth_cap_for(ak)
+            ak = _auth_key(cfg)
+            cap = self._auth_cap_for(ak, cfg)
             return cap <= 0 or active_by_auth.get(ak, 0) < cap
 
         for enforce_cap in (True, False):
@@ -3365,6 +3377,11 @@ async def _selftest_gateway_async() -> None:
                             pf_cnt = sum(1 for v in gw_c2._reserved_cfgs.values() if "vpns-proton-free" + os.sep in v)
                             s_cnt = sum(1 for v in gw_c2._reserved_cfgs.values() if "vpns-surfshark" + os.sep in v)
                             assert p_cnt == 9 and pf_cnt == 1 and s_cnt == 6, (p_cnt, pf_cnt, s_cnt)
+                            assert gw_c2._auth_cap_for("/vpns-surfshark/auth.txt") == 20
+                            assert gw_c2._auth_cap_for("/vpns-proton/auth.txt") == 9
+                            assert gw_c2._auth_cap_for("/vpns-proton-free/auth.txt") == 1
+                            assert gw_c2._auth_cap_for("/vpns-pia/auth.txt") == 20
+                            assert gw_c2._auth_cap_for("/vpns-express/auth.txt") == 10
                         finally:
                             await gw_c2.stop()
                 finally:
