@@ -107,3 +107,6 @@ def test_full_upas_info_formatter_and_collector_buckets():
         "binds": binds, "v2l": True, "country": "ID",
     })
     assert "Belum Buat Karakter" in norole_card and "2FA        : AKTIF" in norole_card
+    assert obv._extract_ban_reason(None) is None
+    assert obv._extract_ban_reason({"full_data": {"ban_seen": False}}) is None
+    assert obv._extract_ban_reason({"full_data": {"ban_seen": True, "ban_info": {"reason_name": "Cheat"}}}) == "Cheat"

@@ -1166,6 +1166,15 @@ def print_result(rtype, email, password, msg=""):
     else:
         render_dashboard()
 
+def _extract_ban_reason(info_res) -> str | None:
+    if not isinstance(info_res, dict):
+        return None
+    fd = info_res.get('full_data')
+    if isinstance(fd, dict) and fd.get('ban_seen'):
+        return str((fd.get('ban_info') or {}).get('reason_name') or 'Banned').strip() or 'Banned'
+    return None
+
+
 def print_hit(email, password, d, info=None):
     idx = stats['checked']
     bi, gi, ci = {}, {}, {}
@@ -4839,6 +4848,12 @@ async def run_worker(wid: int, combos: list, combo_q: asyncio.Queue,
     async def handle_result(kind: str, res_data: dict, user: str, passw: str, dec_d: dict, info_res=None) -> str | None:
         iso_time = now()
         if kind == 'VALID':
+            ban_reason = _extract_ban_reason(info_res)
+            if ban_reason:
+                append_line(FILES['INVALID'], f"{user}:{passw}|BANNED:{ban_reason}|{iso_time}")
+                stats['invalid'] += 1
+                print_result('INVALID', user, passw, f"BANNED ({ban_reason})")
+                return None
             guid = dec_d.get('guid', '')
             sess = dec_d.get('session', '')
             name = dec_d.get('name', '')
