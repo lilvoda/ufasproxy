@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>ufasproxy Induk Controller</title>
-  <link rel="stylesheet" href="/static/styles.css?v=2" />
+  <link rel="stylesheet" href="/static/styles.css?v=3" />
 </head>
 <body>
   <header class="topbar">
@@ -132,6 +132,7 @@
           <button id="sync-out-btn">Sync Output VPS</button>
         </div>
         <div class="muted" id="out-scope-note">Menggabungkan semua folder di direktori output/ VPS ke dalam 1 file output.zip</div>
+        <label class="muted"><input type="checkbox" id="zip-filter-tier" /> Filter output.zip sesuai tier collector terpilih</label>
         <div class="row">
           <button class="primary" id="download-zip-btn">Download output.zip</button>
           <button id="send-tg-btn">Kirim output.zip ke Telegram</button>
@@ -145,8 +146,36 @@
         <div id="sys-msg" class="muted"></div>
       </div>
     </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>Filter Hasil by Tier Collector</h2>
+        <div class="row">
+          <input type="text" id="col-search" placeholder="Cari account / rank / skin..." />
+          <button id="col-refresh-btn">Refresh Tier</button>
+        </div>
+      </div>
+      <div class="tabs" id="col-tier-bar"></div>
+      <div class="muted" id="col-summary-note">Pilih login dulu untuk memuat tier collector.</div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Folder</th>
+              <th>Account</th>
+              <th>Tier Collector</th>
+              <th>Rank</th>
+              <th>Hero / Skin / Dia</th>
+              <th>Status</th>
+              <th>Aksi</th>
+            </tr>
+          </thead>
+          <tbody id="col-tbody"></tbody>
+        </table>
+      </div>
+    </section>
   </main>
 
-  <script src="/static/app.js?v=4"></script>
+  <script src="/static/app.js?v=5"></script>
 </body>
 </html>

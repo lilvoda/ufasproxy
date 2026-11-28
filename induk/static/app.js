@@ -6,6 +6,8 @@ const state = {
   summary: {},
   selected: new Set(),
   comboFilename: "",
+  activeTier: "",
+  collectorData: { tiers: [], items: [], total_cards: 0, total_matched: 0, truncated: false },
   ws: null,
 };
 
@@ -139,6 +141,7 @@ function renderAll() {
       else state.selected.delete(el.dataset.id);
       renderLiveLogs();
       updateOutNote();
+      loadCollectors();
     };
   });
   document.querySelectorAll(".del-vps-btn").forEach((el) => {
@@ -155,11 +158,76 @@ function renderAll() {
   }
 }
 
+function activeTierList() {
+  const chk = $("zip-filter-tier");
+  return chk && chk.checked && state.activeTier ? [state.activeTier] : [];
+}
+
 function updateOutNote() {
   const ids = checkedIds();
-  $("out-scope-note").textContent = ids.length
+  const tl = activeTierList();
+  const tierTxt = tl.length ? ` [Tier: ${tl[0].replace(/^\d+_|\.txt$/g, "").replace(/_/g, " ")}]` : "";
+  $("out-scope-note").textContent = (ids.length
     ? `Target output.zip: ${ids.length} VPS tercentang (${ids.join(", ")}) — semua folder di output/`
-    : "Target output.zip: Semua VPS terdaftar — semua folder di output/";
+    : "Target output.zip: Semua VPS terdaftar — semua folder di output/") + tierTxt;
+}
+
+function renderCollectors() {
+  const d = state.collectorData || {};
+  const tiers = d.tiers || [];
+  const bar = $("col-tier-bar");
+  const allBtn = `<button class="pill ${!state.activeTier ? "active" : ""}" data-tier="">Semua (${num(d.total_cards)})</button>`;
+  bar.innerHTML = allBtn + tiers.map((t) =>
+    `<button class="pill ${state.activeTier === t.key ? "active" : ""}" data-tier="${esc(t.key)}">${esc(t.label)} (${num(t.count)})</button>`
+  ).join("");
+  bar.querySelectorAll(".pill").forEach((el) => {
+    el.onclick = () => {
+      state.activeTier = el.dataset.tier || "";
+      updateOutNote();
+      loadCollectors();
+    };
+  });
+
+  const q = ($("col-search").value || "").trim().toLowerCase();
+  const rows = (d.items || []).filter((it) => {
+    if (!q) return true;
+    return [it.folder, it.account, it.collector, it.rank, it.skin, it.status].some((v) => String(v || "").toLowerCase().includes(q));
+  });
+  $("col-summary-note").textContent = `Menampilkan ${rows.length} dari ${num(d.total_matched)} akun` + (d.truncated ? " (maks 500 pratinjau)" : "");
+  $("col-tbody").innerHTML = rows.map((it, idx) => `<tr>
+    <td>${esc(it.folder)}</td>
+    <td><code>${esc(it.account || "-")}</code></td>
+    <td>${esc(it.collector || it.tier_label)}</td>
+    <td>${esc(it.rank || "-")}</td>
+    <td>${esc(it.hero || "-")} · ${esc(it.skin || "-")} · 💎 ${esc(it.diamond || "0")}</td>
+    <td>${esc(it.status || "-")}</td>
+    <td>
+      <button class="copy-upas-btn" data-idx="${idx}">Copy</button>
+      <details style="display:inline-block"><summary class="muted" style="cursor:pointer">Detail</summary><pre class="card-pre">${esc(it.card)}</pre></details>
+    </td>
+  </tr>`).join("") || '<tr><td colspan="7" class="muted">Belum ada data full_info collector.</td></tr>';
+
+  $("col-tbody").querySelectorAll(".copy-upas-btn").forEach((el) => {
+    el.onclick = () => {
+      const item = rows[Number(el.dataset.idx)];
+      if (item && navigator.clipboard) navigator.clipboard.writeText(item.account || item.card || "");
+      el.textContent = "Copied ✓";
+      setTimeout(() => { el.textContent = "Copy"; }, 1200);
+    };
+  });
+}
+
+async function loadCollectors() {
+  if (!state.uiToken) return;
+  try {
+    const res = await api("/api/v1/results/collectors", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ vps_ids: checkedIds(), tiers: state.activeTier ? [state.activeTier] : [] }),
+    });
+    state.collectorData = res;
+    renderCollectors();
+  } catch (_) {}
 }
 
 function renderJobs() {
@@ -201,7 +269,7 @@ async function loadVps() {
   state.nodes = data.nodes || [];
   state.summary = data.summary || {};
   renderAll();
-  await loadJobs();
+  await Promise.all([loadJobs(), loadCollectors()]);
 }
 
 async function connectWs() {
@@ -229,6 +297,7 @@ async function connectWs() {
     else if (msg.type === "job_output_ready") {
       if (msg.job_id === "output.zip" && msg.vps_id) $("sys-msg").textContent = `Archive output/ VPS ${msg.vps_id} tersinkron ✓`;
       loadJobs();
+      loadCollectors();
     }
     else if (msg.type === "provision_log") { $("prov-log").textContent += msg.line + "\n"; $("prov-log").scrollTop = $("prov-log").scrollHeight; }
   };
@@ -266,7 +335,12 @@ $("logout-btn").onclick = async () => {
 $("chk-all").onchange = (e) => {
   state.nodes.forEach((n) => (e.target.checked ? state.selected.add(n.vps_id) : state.selected.delete(n.vps_id)));
   renderAll();
+  loadCollectors();
 };
+
+$("zip-filter-tier").onchange = () => updateOutNote();
+$("col-search").oninput = () => renderCollectors();
+$("col-refresh-btn").onclick = () => loadCollectors();
 
 $("combo-file").onchange = async (e) => {
   const f = e.target.files[0];
@@ -352,7 +426,7 @@ $("download-zip-btn").onclick = async () => {
     const res = await fetch("/api/v1/results/output.zip", {
       method: "POST",
       headers: headers({ "Content-Type": "application/json" }),
-      body: JSON.stringify({ vps_ids: checkedIds() }),
+      body: JSON.stringify({ vps_ids: checkedIds(), tiers: activeTierList() }),
     });
     if (res.status === 401) clearAuth("Session expired");
     if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
@@ -374,7 +448,7 @@ $("send-tg-btn").onclick = async () => {
     const res = await api("/api/v1/results/output-zip/telegram", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ vps_ids: checkedIds() }),
+      body: JSON.stringify({ vps_ids: checkedIds(), tiers: activeTierList() }),
     });
     if (!res.ok) throw new Error("Telegram API gagal");
     $("sys-msg").textContent = `output.zip (${res.counts.folders} folder) terkirim ke Telegram ✓`;

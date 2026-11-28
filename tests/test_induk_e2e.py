@@ -16,6 +16,7 @@ def test_static_ui_and_full_dispatch_hit_flow(tmp_path):
         assert "run-workers" in html and "run-two-tab" in html
         assert "download-zip-btn" in html and "send-tg-btn" in html
         assert "sync-out-btn" in html and "out-scope-note" in html
+        assert "col-tier-bar" in html and "col-tbody" in html and "zip-filter-tier" in html
         assert "prov-induk-url" not in html and "prov-ptr-url" not in html
         assert "smart-panel" not in html and "Rotate VPN" not in html
         assert client.get("/static/app.js").status_code == 200
@@ -368,4 +369,19 @@ def test_single_output_zip_aggregation(tmp_path, monkeypatch):
         tg_res = client.post("/api/v1/results/output-zip/telegram", json={"vps_ids": []}, headers=hdr)
         assert tg_res.status_code == 200 and tg_res.json()["zip_name"] == "output.zip"
         assert tg_calls and tg_calls[-1][0] == "output.zip"
+
+        # Collector tier filter API: counts across tiers, filters to Amateur Collector, and filters output.zip when requested
+        col_all = client.post("/api/v1/results/collectors", json={"vps_ids": []}, headers=hdr)
+        assert col_all.status_code == 200
+        cdata = col_all.json()
+        assert cdata["total_cards"] == 1 and cdata["total_matched"] == 1
+        assert cdata["items"][0]["tier"] == "08_amateur_collector.txt" and cdata["items"][0]["account"] == "u1:p1"
+        assert client.post("/api/v1/results/collectors", json={"tiers": ["01_world_collector.txt"]}, headers=hdr).json()["total_matched"] == 0
+        assert client.post("/api/v1/results/collectors", json={"tiers": ["bad_tier.txt"]}, headers=hdr).status_code == 400
+        dl_tier = client.post("/api/v1/results/output.zip", json={"tiers": ["08_amateur_collector.txt"]}, headers=hdr)
+        assert dl_tier.status_code == 200
+        with zipfile.ZipFile(io.BytesIO(dl_tier.content), "r") as zf:
+            t_names = set(zf.namelist())
+            assert "combo_a/full_info_by_collector/08_amateur_collector.txt" in t_names
+            assert "combo_b/hit_2fa.txt" not in t_names
 

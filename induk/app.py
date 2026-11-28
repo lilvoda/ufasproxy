@@ -151,6 +151,52 @@ class CheckedResultsBody(BaseModel):
 
 class OutputZipBody(BaseModel):
     vps_ids: list[str] = Field(default_factory=list)
+    tiers: list[str] = Field(default_factory=list)
+
+
+_COLLECTOR_TIERS = (
+    ("01_world_collector.txt", "World Collector"),
+    ("02_mega_collector.txt", "Mega Collector"),
+    ("03_exalted_collector.txt", "Exalted Collector"),
+    ("04_renowned_collector.txt", "Renowned Collector"),
+    ("05_expert_collector.txt", "Expert Collector"),
+    ("06_seasoned_collector.txt", "Seasoned Collector"),
+    ("07_junior_collector.txt", "Junior Collector"),
+    ("08_amateur_collector.txt", "Amateur Collector"),
+    ("09_collector.txt", "Collector (<1k)"),
+    ("10_belum_buat_karakter.txt", "Belum Buat Karakter"),
+)
+_COLLECTOR_TIER_LABELS = dict(_COLLECTOR_TIERS)
+
+
+def _infer_tier_bucket(collector_txt: str) -> str:
+    low = (collector_txt or "").lower()
+    if "no role" in low or "belum" in low:
+        return "10_belum_buat_karakter.txt"
+    for fname, label in _COLLECTOR_TIERS[:8]:
+        if label.lower() in low:
+            return fname
+    return "09_collector.txt"
+
+
+_CARD_KV_RE = re.compile(r"^\s*(STATUS|Account|User:Pass|Collector|Now|Hero|Skin|Diamond)\s*:\s*(.*)$", re.I)
+
+
+def _parse_card_summary(card: str) -> dict[str, str]:
+    kv: dict[str, str] = {}
+    for ln in card.splitlines():
+        m = _CARD_KV_RE.match(ln)
+        if m:
+            kv.setdefault(m.group(1).lower(), m.group(2).strip())
+    return {
+        "account": kv.get("account") or kv.get("user:pass") or "",
+        "status": kv.get("status", ""),
+        "collector": kv.get("collector", ""),
+        "rank": kv.get("now", ""),
+        "hero": kv.get("hero", ""),
+        "skin": kv.get("skin", ""),
+        "diamond": kv.get("diamond", ""),
+    }
 
 
 class VpnDistributeBody(BaseModel):
@@ -865,7 +911,9 @@ def create_app(
         await asyncio.to_thread(_mark_sent)
         return out
 
-    async def _build_single_output_zip(vps_ids: list[str] | None = None) -> tuple[str, bytes, dict]:
+    async def _collect_merged_outputs(
+        vps_ids: list[str] | None = None,
+    ) -> tuple[list[str], list[str], dict[str, dict[str, list[str]]], dict[str, dict[str, list[str]]]]:
         nodes, _ = await db.list_nodes(offline_after_s=offline_s, stall_after_s=stall_s)
         known = {n["vps_id"] for n in nodes}
         if vps_ids:
@@ -894,8 +942,7 @@ def create_app(
             mapped = str(job_folder_map.get(raw_name) or raw_name)
             return re.sub(r"[^A-Za-z0-9._-]+", "_", mapped).strip("._-") or raw_name
 
-        def _assemble_all() -> tuple[str, bytes, dict]:
-            # Map: folder -> rel_path -> merged data (lines list or card blocks)
+        def _assemble_data() -> tuple[list[str], list[str], dict[str, dict[str, list[str]]], dict[str, dict[str, list[str]]]]:
             folder_lines: dict[str, dict[str, list[str]]] = {}
             folder_lines_seen: dict[str, dict[str, set[str]]] = {}
             folder_cards: dict[str, dict[str, list[str]]] = {}
@@ -933,7 +980,6 @@ def create_app(
                 except Exception:
                     continue
 
-            # Also fold per-job live/partial outputs from jobs/<jid>/outputs/<vid>.zip
             jobs_dir = os.path.join(base_data, "jobs")
             target_set = set(clean_ids)
             if target_set and os.path.isdir(jobs_dir):
@@ -956,24 +1002,94 @@ def create_app(
                             continue
 
             folders = sorted(set(folder_lines.keys()) | set(folder_cards.keys()))
-            tot_v = sum(len((folder_lines.get(fd) or {}).get("hit_valid.txt") or []) for fd in folders)
-            tot_f = sum(len((folder_cards.get(fd) or {}).get("full_info_upas_valid.txt") or []) for fd in folders)
-            tot_o = sum(len((folder_lines.get(fd) or {}).get("hit_2fa.txt") or []) for fd in folders)
-            tot_i = sum(len((folder_lines.get(fd) or {}).get("invalid.txt") or []) for fd in folders)
-            tot_e = sum(len((folder_lines.get(fd) or {}).get("err.txt") or []) for fd in folders)
+            return clean_ids, folders, folder_lines, folder_cards
+
+        return await asyncio.to_thread(_assemble_data)
+
+    def _folder_tier_cards(fc: dict[str, list[str]]) -> dict[str, list[str]]:
+        by_tier: dict[str, list[str]] = {}
+        for rel, cards in sorted(fc.items()):
+            if rel.startswith("full_info_by_collector/") and cards:
+                tkey = rel.split("/", 1)[1]
+                by_tier.setdefault(tkey, []).extend(cards)
+        if not by_tier and fc.get("full_info_upas_valid.txt"):
+            for card in fc["full_info_upas_valid.txt"]:
+                tkey = _infer_tier_bucket(_parse_card_summary(card)["collector"])
+                by_tier.setdefault(tkey, []).append(card)
+        return by_tier
+
+    def _validate_tiers(tiers: list[str] | None) -> list[str]:
+        clean = list(dict.fromkeys(str(t or "").strip() for t in (tiers or []) if str(t or "").strip()))
+        bad = [t for t in clean if t not in _COLLECTOR_TIER_LABELS]
+        if bad:
+            raise HTTPException(status_code=400, detail=f"Unknown collector tier: {', '.join(bad)}")
+        return clean
+
+    async def _build_single_output_zip(
+        vps_ids: list[str] | None = None, tiers: list[str] | None = None
+    ) -> tuple[str, bytes, dict]:
+        clean_tiers = _validate_tiers(tiers)
+        clean_ids, folders, folder_lines, folder_cards = await _collect_merged_outputs(vps_ids)
+
+        def _pack_zip() -> tuple[str, bytes, dict]:
+            tier_set = set(clean_tiers)
+            out_folders: list[str] = []
+            filtered_lines: dict[str, dict[str, list[str]]] = {}
+            filtered_cards: dict[str, dict[str, list[str]]] = {}
+
+            for fd in folders:
+                fl = folder_lines.get(fd) or {}
+                fc = folder_cards.get(fd) or {}
+                if not tier_set:
+                    out_folders.append(fd)
+                    filtered_lines[fd] = fl
+                    filtered_cards[fd] = fc
+                    continue
+                tmap = _folder_tier_cards(fc)
+                sel_fc: dict[str, list[str]] = {}
+                combined_cards: list[str] = []
+                matched_accs: set[str] = set()
+                for tkey, cards in sorted(tmap.items()):
+                    if tkey not in tier_set or not cards:
+                        continue
+                    sel_fc[f"full_info_by_collector/{tkey}"] = cards
+                    for c in cards:
+                        combined_cards.append(c)
+                        acc = _parse_card_summary(c)["account"]
+                        if acc:
+                            matched_accs.add(acc)
+                if not combined_cards:
+                    continue
+                sel_fc["full_info_upas_valid.txt"] = combined_cards
+                sel_fl: dict[str, list[str]] = {}
+                if matched_accs and fl.get("hit_valid.txt"):
+                    vlines = [ln for ln in fl["hit_valid.txt"] if ln.split("|", 1)[0].strip() in matched_accs]
+                    if vlines:
+                        sel_fl["hit_valid.txt"] = vlines
+                out_folders.append(fd)
+                filtered_lines[fd] = sel_fl
+                filtered_cards[fd] = sel_fc
+
+            tot_v = sum(len((filtered_lines.get(fd) or {}).get("hit_valid.txt") or []) for fd in out_folders)
+            tot_f = sum(len((filtered_cards.get(fd) or {}).get("full_info_upas_valid.txt") or []) for fd in out_folders)
+            tot_o = sum(len((filtered_lines.get(fd) or {}).get("hit_2fa.txt") or []) for fd in out_folders)
+            tot_i = sum(len((filtered_lines.get(fd) or {}).get("invalid.txt") or []) for fd in out_folders)
+            tot_e = sum(len((filtered_lines.get(fd) or {}).get("err.txt") or []) for fd in out_folders)
 
             summary_rows = [
                 f"VPS      : {', '.join(clean_ids) or '-'}",
-                f"Folders  : {len(folders)}",
+                f"Folders  : {len(out_folders)}",
                 f"Valid    : {tot_v} (Full Info: {tot_f})",
                 f"2FA/OTP  : {tot_o}",
                 f"Invalid  : {tot_i}",
                 f"Error    : {tot_e}",
-                "",
             ]
-            for fd in folders:
-                fl = folder_lines.get(fd) or {}
-                fc = folder_cards.get(fd) or {}
+            if clean_tiers:
+                summary_rows.append("Tiers    : " + ", ".join(_COLLECTOR_TIER_LABELS[t] for t in clean_tiers))
+            summary_rows.append("")
+            for fd in out_folders:
+                fl = filtered_lines.get(fd) or {}
+                fc = filtered_cards.get(fd) or {}
                 summary_rows.append(
                     f"- {fd}/ -> Valid:{len(fl.get('hit_valid.txt') or [])} "
                     f"Full:{len(fc.get('full_info_upas_valid.txt') or [])} "
@@ -984,11 +1100,11 @@ def create_app(
             buf = io.BytesIO()
             with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
                 zf.writestr("summary.txt", ("\n".join(summary_rows) + "\n").encode("utf-8"))
-                for fd in folders:
-                    for rel, lines in sorted((folder_lines.get(fd) or {}).items()):
+                for fd in out_folders:
+                    for rel, lines in sorted((filtered_lines.get(fd) or {}).items()):
                         if lines:
                             zf.writestr(f"{fd}/{rel}", ("\n".join(lines) + "\n").encode("utf-8"))
-                    for rel, cards in sorted((folder_cards.get(fd) or {}).items()):
+                    for rel, cards in sorted((filtered_cards.get(fd) or {}).items()):
                         if cards:
                             body = f"\n\n{_CARD_SEP}\n\n".join(cards) + f"\n\n{_CARD_SEP}\n"
                             zf.writestr(f"{fd}/{rel}", body.encode("utf-8"))
@@ -999,15 +1115,55 @@ def create_app(
                 "invalid.txt": tot_i,
                 "err.txt": tot_e,
                 "full_info": tot_f,
-                "folders": len(folders),
+                "folders": len(out_folders),
             }
             return "output.zip", buf.getvalue(), counts
 
-        return await asyncio.to_thread(_assemble_all)
+        return await asyncio.to_thread(_pack_zip)
+
+    @app.post("/api/v1/results/collectors", dependencies=[Depends(require_ui_auth)])
+    async def filter_results_by_collector(body: OutputZipBody):
+        clean_tiers = _validate_tiers(body.tiers)
+        clean_ids, folders, _, folder_cards = await _collect_merged_outputs(body.vps_ids or None)
+
+        def _build_view() -> dict:
+            tier_counts: dict[str, int] = {k: 0 for k, _ in _COLLECTOR_TIERS}
+            tier_set = set(clean_tiers)
+            matched_items: list[dict[str, str]] = []
+            for fd in folders:
+                tmap = _folder_tier_cards(folder_cards.get(fd) or {})
+                for tkey, cards in tmap.items():
+                    if tkey in tier_counts:
+                        tier_counts[tkey] += len(cards)
+                    if tier_set and tkey not in tier_set:
+                        continue
+                    tlabel = _COLLECTOR_TIER_LABELS.get(tkey, tkey)
+                    for card in cards:
+                        meta = _parse_card_summary(card)
+                        matched_items.append({
+                            "folder": fd,
+                            "tier": tkey,
+                            "tier_label": tlabel,
+                            **meta,
+                            "card": card,
+                        })
+            tier_order = {k: i for i, (k, _) in enumerate(_COLLECTOR_TIERS)}
+            matched_items.sort(key=lambda x: (tier_order.get(x["tier"], 99), x["folder"], x["account"]))
+            max_items = 500
+            return {
+                "vps_ids": clean_ids,
+                "tiers": [{"key": k, "label": lbl, "count": tier_counts[k]} for k, lbl in _COLLECTOR_TIERS],
+                "total_cards": sum(tier_counts.values()),
+                "total_matched": len(matched_items),
+                "truncated": len(matched_items) > max_items,
+                "items": matched_items[:max_items],
+            }
+
+        return await asyncio.to_thread(_build_view)
 
     @app.post("/api/v1/results/output.zip", dependencies=[Depends(require_ui_auth)])
     async def download_single_output_zip(body: OutputZipBody):
-        zip_name, zbytes, _ = await _build_single_output_zip(body.vps_ids or None)
+        zip_name, zbytes, _ = await _build_single_output_zip(body.vps_ids or None, body.tiers or None)
         return Response(
             zbytes,
             media_type="application/zip",
@@ -1016,7 +1172,7 @@ def create_app(
 
     @app.post("/api/v1/results/output-zip/telegram", dependencies=[Depends(require_ui_auth)])
     async def send_single_output_zip_telegram(body: OutputZipBody):
-        zip_name, zbytes, counts = await _build_single_output_zip(body.vps_ids or None)
+        zip_name, zbytes, counts = await _build_single_output_zip(body.vps_ids or None, body.tiers or None)
         return await _send_zip_to_telegram(zip_name, zbytes, counts)
 
     @app.post("/api/v1/results/checked/zip", dependencies=[Depends(require_ui_auth)])
