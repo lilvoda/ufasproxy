@@ -15,6 +15,11 @@ def test_credential_login_basic_auth_and_rate_limit(tmp_path):
         tok = res.json()["token"]
         assert client.get("/api/v1/vps", headers={"X-UI-Token": tok}).status_code == 200
 
+        # Token survives server restart (new app instance with same credentials)
+        app_restarted = create_app(db_path=str(tmp_path / "cred.db"), data_dir=str(tmp_path))
+        with TestClient(app_restarted) as c2:
+            assert c2.get("/api/v1/vps", headers={"X-UI-Token": tok}).status_code == 200
+
         # HTTP Basic Auth works directly too
         b64 = base64.b64encode(b"lilvoda:adminvoda@").decode("ascii")
         assert client.get("/api/v1/vps", headers={"Authorization": f"Basic {b64}"}).status_code == 200

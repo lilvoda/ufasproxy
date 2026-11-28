@@ -6,6 +6,7 @@ import asyncio
 import base64
 import binascii
 import contextlib
+import hashlib
 import hmac
 import io
 import os
@@ -391,7 +392,8 @@ def create_app(
     limiter = _RateLimiter()
     agent_limiter = _RateLimiter()
     ws_tickets: dict[str, float] = {}
-    ui_sessions: dict[str, float] = {}
+    revoked_ui_tokens: dict[str, float] = {}
+    _ui_sign_key = hashlib.sha256(f"{resolved_user}\0{resolved_pass}\0{resolved_key}\0ufasproxy-ui".encode("utf-8")).digest()
     ssh_tasks: set[asyncio.Task[None]] = set()
     job_locks: dict[str, asyncio.Lock] = {}
 
@@ -450,6 +452,24 @@ def create_app(
         u, p = decoded.split(":", 1)
         return _verify_credentials(u, p)
 
+    def _issue_ui_token(ttl_s: float = 86400.0) -> str:
+        exp = int(time.time() + ttl_s)
+        payload = f"{exp}.{secrets.token_hex(8)}"
+        sig = hmac.new(_ui_sign_key, payload.encode("ascii"), hashlib.sha256).hexdigest()
+        return f"{payload}.{sig}"
+
+    def _verify_ui_token(tok: str | None) -> bool:
+        if not tok or tok in revoked_ui_tokens:
+            return False
+        parts = tok.split(".")
+        if len(parts) != 3 or not parts[0].isdigit() or not parts[1] or not parts[2]:
+            return False
+        if int(parts[0]) <= int(time.time()):
+            return False
+        payload = f"{parts[0]}.{parts[1]}".encode("ascii")
+        expected_sig = hmac.new(_ui_sign_key, payload, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(parts[2], expected_sig)
+
     async def require_ui_auth(
         request: Request,
         x_api_key: str | None = Header(default=None, alias="X-API-Key"),
@@ -458,9 +478,8 @@ def create_app(
     ) -> None:
         ip = _client_ip(request)
         limiter.check(ip)
-        now = time.monotonic()
         tok = x_ui_token or _bearer_token(authorization)
-        tok_ok = bool(tok and ui_sessions.get(tok, 0.0) > now)
+        tok_ok = _verify_ui_token(tok)
         key_ok = bool(resolved_key and x_api_key and hmac.compare_digest(x_api_key, resolved_key))
         basic_ok = _basic_auth_ok(authorization)
         if not (tok_ok or key_ok or basic_ok):
@@ -506,13 +525,7 @@ def create_app(
             limiter.record_fail(ip)
             raise HTTPException(status_code=401, detail="Invalid username or password")
         limiter.reset(ip)
-        now = time.monotonic()
-        for k in [k for k, exp in ui_sessions.items() if exp <= now]:
-            ui_sessions.pop(k, None)
-        if len(ui_sessions) >= 128:
-            ui_sessions.pop(next(iter(ui_sessions)), None)
-        tok = secrets.token_urlsafe(32)
-        ui_sessions[tok] = now + 86400.0
+        tok = _issue_ui_token(86400.0)
         return {"ok": True, "token": tok, "username": resolved_user}
 
     @app.post("/api/v1/auth/logout")
@@ -522,7 +535,12 @@ def create_app(
     ):
         tok = x_ui_token or _bearer_token(authorization)
         if tok:
-            ui_sessions.pop(tok, None)
+            now = time.time()
+            for k in [k for k, exp in revoked_ui_tokens.items() if exp <= now]:
+                revoked_ui_tokens.pop(k, None)
+            if len(revoked_ui_tokens) >= 128:
+                revoked_ui_tokens.pop(next(iter(revoked_ui_tokens)), None)
+            revoked_ui_tokens[tok] = now + 86400.0
         return {"ok": True}
 
     @app.post("/api/v1/ui/ws-ticket", dependencies=[Depends(require_ui_auth)])
